@@ -1,0 +1,6 @@
+[build-system]
+# torch must be importable at build time because setup.py imports
+# torch.utils.cpp_extension. Disabling build isolation (see install
+# instructions) is the simplest route; alternatively list torch here.
+requires = ["setuptools>=61", "wheel", "torch>=1.12"]
+build-backend = "setuptools.build_meta"

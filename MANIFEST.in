@@ -1,0 +1,4 @@
+include csrc/*.cpp
+include csrc/*.cu
+include README.md
+recursive-include neural_shift_cuda *.py
