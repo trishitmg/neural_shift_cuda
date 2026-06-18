@@ -15,9 +15,11 @@ For the classic nekre model:
 """
 
 from .nekde_drunet_attn_patch import install_cuda_shift as install_cuda_shift_attn
+from .nekde_drunet_attn_v5_patch import install_cuda_shift as install_cuda_shift_attn_v5
 from .nekre_patch import install_cuda_shift as install_cuda_shift_nekre
 
 __all__ = [
     "install_cuda_shift_attn",
+    "install_cuda_shift_attn_v5",
     "install_cuda_shift_nekre",
 ]
