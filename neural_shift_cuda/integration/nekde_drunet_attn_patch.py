@@ -70,12 +70,27 @@ def _get_shift_tensor(self, device: torch.device) -> torch.Tensor:
     """Cache the (S, 3) int32 shift tensor on `device`."""
     if (getattr(self, "_cached_shift_tensor", None) is None
             or self._cached_shift_device != device):
-        shifts = self._collect_shifts()              # [(dx, dy, has_inverse), ...]
+        # [(dx, dy, has_inverse), ...]
+        shifts = self._collect_shifts()
         rows = [(int(dx), int(dy), int(bool(hi))) for (dx, dy, hi) in shifts]
         self._cached_shift_tensor = torch.tensor(
             rows, dtype=torch.int32, device=device)
         self._cached_shift_device = device
     return self._cached_shift_tensor
+
+
+def _head_mix_mat(self) -> Optional[torch.Tensor]:
+    """Build the (C, n_heads) head-mixing matrix using the model's own
+    `head_mix_pos_act`. Matches NeKDeDRUNetAttn.forward exactly; defaults to
+    'softmax' for instances that lack the attribute (e.g. v3/v4)."""
+    if self.raw_head_mix is None:
+        return None
+    act = getattr(self, "head_mix_pos_act", "softmax")
+    if act == "softmax":
+        return F.softmax(self.raw_head_mix, dim=1)
+    if act == "softplus":
+        return F.softplus(self.raw_head_mix)
+    return F.relu(self.raw_head_mix)
 
 
 def _mix_heads_vec(
@@ -145,11 +160,8 @@ def _forward_cuda(
     S = shifts_t.shape[0]
     chunk = self.max_batch_shifts if self.max_batch_shifts is not None else S
 
-    # ---- Head-mixing matrix ----
-    head_mix_mat = (
-        F.softmax(self.raw_head_mix, dim=1)
-        if self.raw_head_mix is not None else None
-    )
+    # ---- Head-mixing matrix (respects head_mix_pos_act; defaults to softmax) ----
+    head_mix_mat = _head_mix_mat(self)
 
     # ------------------------------------------------------------------
     # Per-chunk weight computation.
@@ -165,7 +177,8 @@ def _forward_cuda(
     # The mask tiles are concatenated outside the loop -- we need the
     # full (S*B, 1, H, W) mask for the accumulator.
     # ------------------------------------------------------------------
-    weight_tiles: List[torch.Tensor] = []   # logits or weights depending on path
+    # logits or weights depending on path
+    weight_tiles: List[torch.Tensor] = []
     mask_tiles: List[torch.Tensor] = []
 
     for start in range(0, S, chunk):
@@ -173,7 +186,8 @@ def _forward_cuda(
         n = end - start
         shifts_chunk = shifts_xy[start:end]                      # (n, 2) int32
 
-        phi_s_batch, mask_chunk = shift_gather(phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
+        phi_s_batch, mask_chunk = shift_gather(
+            phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
         phi_c_batch = phi.repeat(n, 1, 1, 1)
         sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
 
@@ -203,10 +217,12 @@ def _forward_cuda(
         # Stack: (B, S, n_heads, H, W)
         logits = torch.stack(weight_tiles, dim=1)
         logits = logits - logits.amax(dim=1, keepdim=True)
-        w_per_shift = F.softmax(logits, dim=1)                   # (B, S, n_heads, H, W)
+        # (B, S, n_heads, H, W)
+        w_per_shift = F.softmax(logits, dim=1)
     else:
         # Already positive; just stack.
-        w_per_shift = torch.stack(weight_tiles, dim=1)           # (B, S, n_heads, H, W)
+        # (B, S, n_heads, H, W)
+        w_per_shift = torch.stack(weight_tiles, dim=1)
 
     # Reorder to shift-major to match shift_gather/accumulate_uz convention.
     # (B, S, h, H, W) -> (S, B, h, H, W)
@@ -217,7 +233,8 @@ def _forward_cuda(
 
     # Flatten to (S*B, C, H, W) and apply forward validity mask.
     w_all = w_stack.view(S * B, C, H, W)
-    mask_all = torch.cat(mask_tiles, dim=0)                      # (S*B, 1, H, W)
+    # (S*B, 1, H, W)
+    mask_all = torch.cat(mask_tiles, dim=0)
     w_all = (w_all * mask_all).contiguous()
 
     # ---- Single fused U/Z accumulation (forward + inverse symmetry) ----
