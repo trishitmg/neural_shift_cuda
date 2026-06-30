@@ -12,7 +12,7 @@ def _src(p):
 
 setup(
     name="neural_shift_cuda",
-    version="0.3.0",
+    version="0.3.1",
     description="CUDA shift-gather / pair-gather / accumulate ops for nekre.",
     # picks up neural_shift_cuda/ and neural_shift_cuda/integration/
     packages=find_packages(),
