@@ -4,7 +4,7 @@ neural_shift_cuda.metropolis
 Thin wrapper around the fused CUDA op `metropolis_aggregate` (csrc/) used by
 nkd_metropolis_attn_v2 / v5. Exposes a single function
 
-    metropolis_aggregate(w_half, img, shifts, use_box, eps) -> (Wx, d)
+    metropolis_aggregate(w_half, img, shifts, use_box, eps) -> (Wx, d, d_hat)
 
 that calls the compiled CUDA kernel when available and otherwise falls back to a
 pure-PyTorch implementation with identical semantics (so the NKD modules run
@@ -19,7 +19,7 @@ Conventions (must match the kernel and the NKD reference forward):
   * shifts : (S, 3) int64 = (dx, dy, has_inverse).
   * use_box: 1 -> v2 comp_box (wrap-around neighbours masked out);
              0 -> v5 pure circular.
-Returns (Wx, d) where Wx = x - d_hat (.) x + K_hat x and d = K e.
+Returns (Wx, d, d_hat) where Wx = x - d_hat (.) x + K_hat x, d = K e, d_hat = K_hat e.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 try:  # compiled extension (built from csrc/metropolis_cuda.cu + metropolis.cpp)
-    from .. import _C as _ext  # type: ignore
+    from . import _C as _ext  # type: ignore
     _HAS_EXT = hasattr(_ext, "metropolis_aggregate")
 except Exception:  # pragma: no cover - extension optional
     _ext = None

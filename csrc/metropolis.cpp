@@ -15,36 +15,39 @@
 #include <torch/extension.h>
 #include <vector>
 
-namespace neural_shift {
+namespace neural_shift
+{
 
-// Defined in metropolis_cuda.cu
-std::vector<torch::Tensor> metropolis_aggregate_cuda(
-    torch::Tensor w_half,
-    torch::Tensor img,
-    torch::Tensor shifts,
-    int64_t use_box,
-    double eps);
+  // Defined in metropolis_cuda.cu
+  std::vector<torch::Tensor> metropolis_aggregate_cuda(
+      torch::Tensor w_half,
+      torch::Tensor img,
+      torch::Tensor shifts,
+      int64_t use_box,
+      double eps);
 
-std::vector<torch::Tensor> metropolis_aggregate(
-    torch::Tensor w_half,
-    torch::Tensor img,
-    torch::Tensor shifts,
-    int64_t use_box,
-    double eps) {
-  return metropolis_aggregate_cuda(w_half, img, shifts, use_box, eps);
-}
+  std::vector<torch::Tensor> metropolis_aggregate(
+      torch::Tensor w_half,
+      torch::Tensor img,
+      torch::Tensor shifts,
+      int64_t use_box,
+      double eps)
+  {
+    return metropolis_aggregate_cuda(w_half, img, shifts, use_box, eps);
+  }
 
-// Call this from the repo's existing PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
-// block: add `neural_shift::register_metropolis(m);` (and a forward decl
-// `namespace neural_shift { void register_metropolis(pybind11::module_&); }`).
-void register_metropolis(pybind11::module_ &m) {
-  m.def("metropolis_aggregate", &metropolis_aggregate,
-        "Fused Metropolis-Hastings aggregate -> (Wx, d) (CUDA)",
-        pybind11::arg("w_half"), pybind11::arg("img"), pybind11::arg("shifts"),
-        pybind11::arg("use_box"), pybind11::arg("eps") = 1e-6);
-}
+  // Call this from the repo's existing PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+  // block: add `neural_shift::register_metropolis(m);` (and a forward decl
+  // `namespace neural_shift { void register_metropolis(pybind11::module_&); }`).
+  void register_metropolis(pybind11::module_ &m)
+  {
+    m.def("metropolis_aggregate", &metropolis_aggregate,
+          "Fused Metropolis-Hastings aggregate -> (Wx, d, d_hat) (CUDA)",
+          pybind11::arg("w_half"), pybind11::arg("img"), pybind11::arg("shifts"),
+          pybind11::arg("use_box"), pybind11::arg("eps") = 1e-6);
+  }
 
-}  // namespace neural_shift
+} // namespace neural_shift
 
 // -----------------------------------------------------------------------------
 // Standalone fallback ONLY for building this op as its own private module during
@@ -52,7 +55,8 @@ void register_metropolis(pybind11::module_ &m) {
 // real module. Define NEURAL_SHIFT_METROPOLIS_STANDALONE to enable.
 // -----------------------------------------------------------------------------
 #ifdef NEURAL_SHIFT_METROPOLIS_STANDALONE
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
   neural_shift::register_metropolis(m);
 }
 #endif
