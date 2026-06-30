@@ -28,6 +28,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:  # compiled extension (built from csrc/metropolis_cuda.cu + metropolis.cpp)
     from . import _C as _ext  # type: ignore
@@ -114,12 +115,22 @@ def metropolis_aggregate(
     shifts: List[Tuple[int, int, bool]],
     use_box: bool,
     eps: float = 1e-6,
+    checkpoint_train: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dispatch to the CUDA kernel if built and inputs are on GPU, else PyTorch.
 
     Returns ``(Wx, d, d_hat)`` where ``Wx = (1 - d_hat) * x + K_hat x``,
     ``d = K e`` (raw degree) and ``d_hat = K_hat e`` (the value the model's
     ``forward`` returns as ``degree_hat``).
+
+    The fused CUDA kernel has no backward, so training (grad enabled) takes the
+    pure-PyTorch path. That path builds a two-pass, per-shift accumulation graph
+    whose retained activations scale like O(S) and blow up memory at large
+    window radius / batch. When ``checkpoint_train`` is set (default) the
+    PyTorch accumulation is wrapped in gradient checkpointing: the per-shift
+    intermediates are freed after the forward and recomputed in the backward,
+    which restores the low-memory profile of the old fused ``accumulate_uz``
+    path at the cost of one extra (cheap, network-free) accumulation pass.
     """
     if _HAS_EXT and img.is_cuda and not torch.is_grad_enabled():
         # The fused kernel is for inference / fixed-point iteration (no autograd
@@ -129,4 +140,14 @@ def metropolis_aggregate(
             w_half.contiguous(), img.contiguous(), shifts_t,
             int(bool(use_box)), float(eps))
         return Wx, d, d_hat
+
+    if (checkpoint_train and torch.is_grad_enabled()
+            and (w_half.requires_grad or img.requires_grad)):
+        # Recompute the accumulation in backward instead of storing every
+        # per-shift intermediate. shifts/use_box/eps are captured by closure so
+        # only the tensors (w_half, img) are checkpoint inputs.
+        def _run(w_half_, img_):
+            return metropolis_aggregate_torch(w_half_, img_, shifts, use_box, eps)
+        return checkpoint(_run, w_half, img, use_reentrant=False)
+
     return metropolis_aggregate_torch(w_half, img, shifts, use_box, eps)

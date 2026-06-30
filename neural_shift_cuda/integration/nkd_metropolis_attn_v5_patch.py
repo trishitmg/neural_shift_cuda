@@ -93,7 +93,7 @@ def _forward_cuda(
     w_half, shifts = _build_w_half(self, x, guide, sig)
     eps = max(self.metropolis_eps, torch.finfo(x.dtype).tiny)
     Wx, _d, degree_hat = metropolis_aggregate(
-        w_half, x, shifts, use_box=_USE_BOX, eps=eps)
+        w_half, x, shifts, use_box=_USE_BOX, eps=eps, use_grad_checkpoint=self.use_grad_checkpoint)
     return Wx, degree_hat
 
 
