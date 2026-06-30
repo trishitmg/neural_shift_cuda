@@ -26,6 +26,8 @@ setup(
             sources=[
                 _src("csrc/shift_ops.cpp"),
                 _src("csrc/shift_ops_cuda.cu"),
+                _src("csrc/metropolis.cpp"),
+                _src("csrc/metropolis_cuda.cu"),
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
