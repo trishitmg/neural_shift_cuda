@@ -42,7 +42,7 @@ namespace neural_shift
   void register_metropolis(pybind11::module_ &m)
   {
     m.def("metropolis_aggregate", &metropolis_aggregate,
-          "Fused Metropolis-Hastings aggregate -> (Wx, d, d_hat) (CUDA)",
+          "Fused Metropolis-Hastings aggregate -> (Wx, d_hat) (CUDA)",
           pybind11::arg("w_half"), pybind11::arg("img"), pybind11::arg("shifts"),
           pybind11::arg("use_box"), pybind11::arg("eps") = 1e-6);
   }

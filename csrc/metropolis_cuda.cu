@@ -169,7 +169,7 @@ __global__ void metropolis_aggregate_kernel(
 }
 
 // -----------------------------------------------------------------------------
-// Host entry point. Returns (Wx, d). Both passes share the same launch config.
+// Host entry point. Returns (Wx, d_hat). Both passes share the same launch config.
 // -----------------------------------------------------------------------------
 std::vector<torch::Tensor> metropolis_aggregate_cuda(
     torch::Tensor w_half,   // (B, S, C, H, W), contiguous, float/half
@@ -215,8 +215,8 @@ std::vector<torch::Tensor> metropolis_aggregate_cuda(
 
   // W x = x - d_hat (.) x + K_hat x  (elementwise; ATen handles the launch).
   auto Wx = img - d_hat * img + khat_x;
-  // (Wx, d = K e, d_hat = K_hat e). d_hat is the model's `degree_hat`.
-  return {Wx, d, d_hat};
+  // Return (Wx, d_hat = K_hat e). d (= K e) is an internal-only intermediate.
+  return {Wx, d_hat};
 }
 
 }  // namespace neural_shift

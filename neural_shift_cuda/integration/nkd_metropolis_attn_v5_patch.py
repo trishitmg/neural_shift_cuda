@@ -92,8 +92,8 @@ def _forward_cuda(
         raise ValueError(f"x must have shape (B,C,H,W), got {tuple(x.shape)}.")
     w_half, shifts = _build_w_half(self, x, guide, sig)
     eps = max(self.metropolis_eps, torch.finfo(x.dtype).tiny)
-    Wx, _d, degree_hat = metropolis_aggregate(
-        w_half, x, shifts, use_box=_USE_BOX, eps=eps, checkpoint_train=self.use_grad_checkpoint)
+    Wx, degree_hat = metropolis_aggregate(
+        w_half, x, shifts, use_box=_USE_BOX, eps=eps)
     return Wx, degree_hat
 
 
@@ -107,7 +107,8 @@ def install_cuda_shift(model_cls):
     if getattr(model_cls, "_metropolis_cuda_forward_installed", False):
         return model_cls
     if not hasattr(model_cls, "forward"):
-        raise TypeError("model_cls must provide forward(x, guide=None, sig=None).")
+        raise TypeError(
+            "model_cls must provide forward(x, guide=None, sig=None).")
 
     original_forward = model_cls.forward
 

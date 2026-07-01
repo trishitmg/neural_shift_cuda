@@ -4,7 +4,7 @@ neural_shift_cuda.metropolis
 Thin wrapper around the fused CUDA op `metropolis_aggregate` (csrc/) used by
 nkd_metropolis_attn_v2 / v5. Exposes a single function
 
-    metropolis_aggregate(w_half, img, shifts, use_box, eps) -> (Wx, d, d_hat)
+    metropolis_aggregate(w_half, img, shifts, use_box, eps) -> (Wx, d_hat)
 
 that calls the compiled CUDA kernel when available and otherwise falls back to a
 pure-PyTorch implementation with identical semantics (so the NKD modules run
@@ -19,7 +19,7 @@ Conventions (must match the kernel and the NKD reference forward):
   * shifts : (S, 3) int64 = (dx, dy, has_inverse).
   * use_box: 1 -> v2 comp_box (wrap-around neighbours masked out);
              0 -> v5 pure circular.
-Returns (Wx, d, d_hat) where Wx = x - d_hat (.) x + K_hat x, d = K e, d_hat = K_hat e.
+Returns (Wx, d_hat) where Wx = x - d_hat (.) x + K_hat x and d_hat = K_hat e.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def metropolis_aggregate_torch(
     shifts: List[Tuple[int, int, bool]],
     use_box: bool,
     eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference PyTorch path; identical math to the CUDA kernel."""
     B, S, C, H, W = w_half.shape
     R = max(max(abs(dx), abs(dy)) for (dx, dy, _) in shifts)
@@ -104,9 +104,8 @@ def metropolis_aggregate_torch(
             d_hat = d_hat + wk_i
 
     Wx = img - d_hat * img + khat_x
-    # d      = K e        (raw degree, kept for interface compatibility)
     # d_hat  = K_hat e    (the row-sum the model's forward returns as `degree_hat`)
-    return Wx, d, d_hat
+    return Wx, d_hat
 
 
 def metropolis_aggregate(
@@ -116,12 +115,13 @@ def metropolis_aggregate(
     use_box: bool,
     eps: float = 1e-6,
     checkpoint_train: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Dispatch to the CUDA kernel if built and inputs are on GPU, else PyTorch.
 
-    Returns ``(Wx, d, d_hat)`` where ``Wx = (1 - d_hat) * x + K_hat x``,
-    ``d = K e`` (raw degree) and ``d_hat = K_hat e`` (the value the model's
-    ``forward`` returns as ``degree_hat``).
+    Returns ``(Wx, d_hat)`` where ``Wx = (1 - d_hat) * x + K_hat x`` and
+    ``d_hat = K_hat e`` (the value the model's ``forward`` returns as
+    ``degree_hat``). The raw degree ``d = K e`` is used internally to form the
+    Metropolis denominators but is not returned.
 
     The fused CUDA kernel has no backward, so training (grad enabled) takes the
     pure-PyTorch path. That path builds a two-pass, per-shift accumulation graph
@@ -136,10 +136,10 @@ def metropolis_aggregate(
         # The fused kernel is for inference / fixed-point iteration (no autograd
         # through the kernel). Training uses the differentiable PyTorch path.
         shifts_t = _shifts_to_tensor(shifts, img.device)
-        Wx, d, d_hat = _ext.metropolis_aggregate(
+        Wx, d_hat = _ext.metropolis_aggregate(
             w_half.contiguous(), img.contiguous(), shifts_t,
             int(bool(use_box)), float(eps))
-        return Wx, d, d_hat
+        return Wx, d_hat
 
     if (checkpoint_train and torch.is_grad_enabled()
             and (w_half.requires_grad or img.requires_grad)):
