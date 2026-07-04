@@ -395,6 +395,147 @@ __global__ void accumulate_uz_backward_w_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// accumulate_uz_scalar forward / backward  (GASD scalar-per-transform)
+//   weights is (S, B, C): ONE scalar per (transform, image, channel), constant
+//   over space, so it is never materialized as (S*B, C, H, W). Gather
+//   convention (matches shift_gather):
+//     U[b,c,h,w] = sum_s weights[s,b,c] * x[b,c,(h+dx_s)%H,(w+dy_s)%W]
+//     Z[b,c,h,w] = sum_s weights[s,b,c]
+//   No boundary mask (circular) and no inverse-symmetry branch: GASD's
+//   transforms are exact permutations with independent scalar weights.
+//   All three kernels are atomic-free (each output element is owned by exactly
+//   one thread), so results are deterministic.
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t>
+__global__ void accumulate_uz_scalar_forward_kernel(
+    const scalar_t* __restrict__ x,        // (B, C, H, W)
+    const scalar_t* __restrict__ weights,  // (S, B, C)
+    const int*      __restrict__ shifts,   // (S, shift_stride)
+    scalar_t*       __restrict__ U,        // (B, C, H, W)
+    scalar_t*       __restrict__ Z,        // (B, C, H, W)
+    int S, int B, int C, int H, int W,
+    int shift_stride)
+{
+    const int N = B * C * H * W;
+    CUDA_KERNEL_LOOP(idx, N) {
+        int w = idx % W;
+        int t = idx / W;
+        int h = t % H;            t /= H;
+        int c = t % C;
+        int b = t / C;
+
+        const int x_base = (b * C + c) * H * W;
+
+        scalar_t u_val = scalar_t(0);
+        scalar_t z_val = scalar_t(0);
+
+        for (int s = 0; s < S; ++s) {
+            const int dx = shifts[s * shift_stride + 0];
+            const int dy = shifts[s * shift_stride + 1];
+
+            int sh = h + dx;
+            if (sh < 0)        sh += H;
+            else if (sh >= H)  sh -= H;
+            int sw = w + dy;
+            if (sw < 0)        sw += W;
+            else if (sw >= W)  sw -= W;
+
+            const scalar_t wv = weights[(s * B + b) * C + c];
+            u_val += wv * x[x_base + sh * W + sw];
+            z_val += wv;
+        }
+
+        U[idx] = u_val;
+        Z[idx] = z_val;
+    }
+}
+
+template <typename scalar_t>
+__global__ void accumulate_uz_scalar_backward_x_kernel(
+    const scalar_t* __restrict__ weights,  // (S, B, C)
+    const scalar_t* __restrict__ grad_U,   // (B, C, H, W)
+    const int*      __restrict__ shifts,   // (S, shift_stride)
+    scalar_t*       __restrict__ grad_x,   // (B, C, H, W)
+    int S, int B, int C, int H, int W,
+    int shift_stride)
+{
+    // Z is independent of x, so grad_Z contributes nothing to grad_x.
+    // x[b,c,h,w] is read by output position (h-dx, w-dy) (circular) for shift s.
+    const int N = B * C * H * W;
+    CUDA_KERNEL_LOOP(idx, N) {
+        int w = idx % W;
+        int t = idx / W;
+        int h = t % H;            t /= H;
+        int c = t % C;
+        int b = t / C;
+
+        const int gu_base = (b * C + c) * H * W;
+
+        scalar_t gx = scalar_t(0);
+        for (int s = 0; s < S; ++s) {
+            const int dx = shifts[s * shift_stride + 0];
+            const int dy = shifts[s * shift_stride + 1];
+
+            int oh = h - dx;
+            if (oh < 0)        oh += H;
+            else if (oh >= H)  oh -= H;
+            int ow = w - dy;
+            if (ow < 0)        ow += W;
+            else if (ow >= W)  ow -= W;
+
+            const scalar_t wv = weights[(s * B + b) * C + c];
+            gx += wv * grad_U[gu_base + oh * W + ow];
+        }
+        grad_x[idx] = gx;
+    }
+}
+
+template <typename scalar_t>
+__global__ void accumulate_uz_scalar_backward_w_kernel(
+    const scalar_t* __restrict__ x,        // (B, C, H, W)
+    const scalar_t* __restrict__ grad_U,   // (B, C, H, W)
+    const scalar_t* __restrict__ grad_Z,   // (B, C, H, W)
+    const int*      __restrict__ shifts,   // (S, shift_stride)
+    scalar_t*       __restrict__ grad_w,   // (S, B, C)
+    int S, int B, int C, int H, int W,
+    int shift_stride)
+{
+    // One thread per (s, b, c); reduce over the H*W grid.
+    //   grad_w[s,b,c] = sum_{h,w} grad_U[b,c,h,w] * x[b,c,(h+dx)%H,(w+dy)%W]
+    //                 + sum_{h,w} grad_Z[b,c,h,w]
+    const int M = S * B * C;
+    CUDA_KERNEL_LOOP(sbc, M) {
+        int c = sbc % C;
+        int t = sbc / C;
+        int b = t % B;
+        int s = t / B;
+
+        const int dx = shifts[s * shift_stride + 0];
+        const int dy = shifts[s * shift_stride + 1];
+        const int base = (b * C + c) * H * W;
+
+        scalar_t gw = scalar_t(0);
+        for (int h = 0; h < H; ++h) {
+            int sh = h + dx;
+            if (sh < 0)        sh += H;
+            else if (sh >= H)  sh -= H;
+            for (int w = 0; w < W; ++w) {
+                int sw = w + dy;
+                if (sw < 0)        sw += W;
+                else if (sw >= W)  sw -= W;
+
+                const int o_idx = base + h * W + w;
+                const int x_idx = base + sh * W + sw;
+                gw += grad_U[o_idx] * x[x_idx];
+                gw += grad_Z[o_idx];
+            }
+        }
+        grad_w[sbc] = gw;
+    }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -576,5 +717,71 @@ void launch_accumulate_uz_backward(
             shifts.data_ptr<int>(),
             grad_w.data_ptr<scalar_t>(),
             S, B, C, H, W);
+    });
+}
+
+void launch_accumulate_uz_scalar_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& weights,
+    const torch::Tensor& shifts,
+    torch::Tensor& U,
+    torch::Tensor& Z)
+{
+    const int B = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+    const int S = shifts.size(0);
+    const int shift_stride = shifts.size(1);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int N = B * C * H * W;
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "accumulate_uz_scalar_fwd", [&] {
+        accumulate_uz_scalar_forward_kernel<scalar_t><<<n_blocks(N), THREADS, 0, stream>>>(
+            x.data_ptr<scalar_t>(),
+            weights.data_ptr<scalar_t>(),
+            shifts.data_ptr<int>(),
+            U.data_ptr<scalar_t>(),
+            Z.data_ptr<scalar_t>(),
+            S, B, C, H, W, shift_stride);
+    });
+}
+
+void launch_accumulate_uz_scalar_backward(
+    const torch::Tensor& x,
+    const torch::Tensor& weights,
+    const torch::Tensor& grad_U,
+    const torch::Tensor& grad_Z,
+    const torch::Tensor& shifts,
+    torch::Tensor& grad_x,
+    torch::Tensor& grad_w)
+{
+    const int B = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int W = x.size(3);
+    const int S = shifts.size(0);
+    const int shift_stride = shifts.size(1);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int Nx = B * C * H * W;
+    const int Mw = S * B * C;
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "accumulate_uz_scalar_bwd_x", [&] {
+        accumulate_uz_scalar_backward_x_kernel<scalar_t><<<n_blocks(Nx), THREADS, 0, stream>>>(
+            weights.data_ptr<scalar_t>(),
+            grad_U.data_ptr<scalar_t>(),
+            shifts.data_ptr<int>(),
+            grad_x.data_ptr<scalar_t>(),
+            S, B, C, H, W, shift_stride);
+    });
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "accumulate_uz_scalar_bwd_w", [&] {
+        accumulate_uz_scalar_backward_w_kernel<scalar_t><<<n_blocks(Mw), THREADS, 0, stream>>>(
+            x.data_ptr<scalar_t>(),
+            grad_U.data_ptr<scalar_t>(),
+            grad_Z.data_ptr<scalar_t>(),
+            shifts.data_ptr<int>(),
+            grad_w.data_ptr<scalar_t>(),
+            S, B, C, H, W, shift_stride);
     });
 }

@@ -12,8 +12,9 @@ def _src(p):
 
 setup(
     name="neural_shift_cuda",
-    version="0.3.4",
-    description="CUDA shift-gather / pair-gather / accumulate ops for nekre.",
+    version="0.4.0",
+    description="CUDA shift-gather / pair-gather / accumulate (per-pixel and "
+                "scalar-per-transform) ops for NeKDe / GASD denoisers.",
     # picks up neural_shift_cuda/ and neural_shift_cuda/integration/
     packages=find_packages(),
     # ship the kernel sources inside the wheel/sdist so a non-editable

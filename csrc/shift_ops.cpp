@@ -35,6 +35,16 @@ void launch_accumulate_uz_backward(
     const torch::Tensor &shifts,
     torch::Tensor &grad_x, torch::Tensor &grad_w);
 
+void launch_accumulate_uz_scalar_forward(
+    const torch::Tensor &x, const torch::Tensor &weights,
+    const torch::Tensor &shifts, torch::Tensor &U, torch::Tensor &Z);
+
+void launch_accumulate_uz_scalar_backward(
+    const torch::Tensor &x, const torch::Tensor &weights,
+    const torch::Tensor &grad_U, const torch::Tensor &grad_Z,
+    const torch::Tensor &shifts,
+    torch::Tensor &grad_x, torch::Tensor &grad_w);
+
 // ---------- helper macros ----------
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIG(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -184,6 +194,57 @@ std::vector<torch::Tensor> accumulate_uz_backward(
 }
 
 // ===========================================================================
+// accumulate_uz_scalar  (GASD scalar-per-transform)
+//   weights is (S, B, C): one scalar per (transform, image, channel). shifts
+//   is (S, 2) or (S, 3) (only the first two columns are read). No mask, no
+//   inverse-symmetry branch.
+// ===========================================================================
+
+std::vector<torch::Tensor> accumulate_uz_scalar_forward(
+    torch::Tensor x, torch::Tensor weights, torch::Tensor shifts)
+{
+    CHECK_CUDA(x);
+    CHECK_CONTIG(x);
+    CHECK_NCHW(x);
+    CHECK_CUDA(weights);
+    CHECK_CONTIG(weights);
+    TORCH_CHECK(weights.dim() == 3, "accumulate_uz_scalar: weights must be (S, B, C)");
+    shifts = _prep_shifts(shifts.to(x.device()));
+
+    const int64_t B = x.size(0);
+    const int64_t C = x.size(1);
+    const int64_t S = shifts.size(0);
+    TORCH_CHECK(weights.size(0) == S && weights.size(1) == B && weights.size(2) == C,
+                "weights shape must be (S, B, C)");
+
+    auto U = torch::empty_like(x);
+    auto Z = torch::empty_like(x);
+    launch_accumulate_uz_scalar_forward(x, weights, shifts, U, Z);
+    return {U, Z};
+}
+
+std::vector<torch::Tensor> accumulate_uz_scalar_backward(
+    torch::Tensor x, torch::Tensor weights,
+    torch::Tensor grad_U, torch::Tensor grad_Z, torch::Tensor shifts)
+{
+    CHECK_CUDA(x);
+    CHECK_CONTIG(x);
+    CHECK_CUDA(weights);
+    CHECK_CONTIG(weights);
+    CHECK_CUDA(grad_U);
+    CHECK_CONTIG(grad_U);
+    CHECK_CUDA(grad_Z);
+    CHECK_CONTIG(grad_Z);
+    shifts = _prep_shifts(shifts.to(x.device()));
+
+    auto grad_x = torch::empty_like(x);
+    auto grad_w = torch::empty_like(weights);
+    launch_accumulate_uz_scalar_backward(
+        x, weights, grad_U, grad_Z, shifts, grad_x, grad_w);
+    return {grad_x, grad_w};
+}
+
+// ===========================================================================
 
 // Defined in metropolis.cpp -- registers metropolis_aggregate into this module.
 namespace neural_shift
@@ -199,5 +260,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pair_gather_backward", &pair_gather_backward, "pair_gather backward");
     m.def("accumulate_uz_forward", &accumulate_uz_forward, "accumulate_uz forward");
     m.def("accumulate_uz_backward", &accumulate_uz_backward, "accumulate_uz backward");
+    m.def("accumulate_uz_scalar_forward", &accumulate_uz_scalar_forward,
+          "accumulate_uz_scalar forward");
+    m.def("accumulate_uz_scalar_backward", &accumulate_uz_scalar_backward,
+          "accumulate_uz_scalar backward");
     neural_shift::register_metropolis(m);
 }
