@@ -12,7 +12,7 @@ def _src(p):
 
 setup(
     name="neural_shift_cuda",
-    version="0.4.0",
+    version="0.4.1",
     description="CUDA shift-gather / pair-gather / accumulate (per-pixel and "
                 "scalar-per-transform) ops for NeKDe / GASD denoisers.",
     # picks up neural_shift_cuda/ and neural_shift_cuda/integration/
