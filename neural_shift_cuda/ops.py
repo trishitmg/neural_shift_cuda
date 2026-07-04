@@ -36,7 +36,8 @@ except Exception:  # pragma: no cover -- CPU-only env / build failure
 
 def _wrap_shifts(shifts: torch.Tensor) -> torch.Tensor:
     if shifts.dim() != 2 or shifts.size(1) not in (2, 3):
-        raise ValueError(f"shifts must be (S, 2) or (S, 3); got {tuple(shifts.shape)}")
+        raise ValueError(
+            f"shifts must be (S, 2) or (S, 3); got {tuple(shifts.shape)}")
     return shifts.to(torch.int64)
 
 
@@ -59,7 +60,8 @@ def shift_gather_reference(
 
     if R == 0:
         gs_batch = guide.repeat(S, 1, 1, 1).contiguous()
-        mask = torch.ones(S * B, 1, H, W, device=guide.device, dtype=guide.dtype)
+        mask = torch.ones(
+            S * B, 1, H, W, device=guide.device, dtype=guide.dtype)
         return gs_batch, mask
 
     padded_guide = F.pad(guide, (R, R, R, R), mode='circular')
@@ -71,7 +73,8 @@ def shift_gather_reference(
     for i in range(S):
         dx = int(shifts[i, 0].item())
         dy = int(shifts[i, 1].item())
-        gs_list.append(padded_guide[:, :, R + dx:R + dx + H, R + dy:R + dy + W])
+        gs_list.append(
+            padded_guide[:, :, R + dx:R + dx + H, R + dy:R + dy + W])
         mask_list.append(
             box[:, :, R + dx:R + dx + H, R + dy:R + dy + W].expand(B, 1, H, W)
         )
@@ -94,7 +97,8 @@ def pair_gather_reference(
     B = guide.size(0)
     S = gs_batch.size(0) // B
 
-    center = guide.unsqueeze(0).expand(S, B, *guide.shape[1:]).reshape_as(gs_batch)
+    center = guide.unsqueeze(0).expand(
+        S, B, *guide.shape[1:]).reshape_as(gs_batch)
     pair_batch = torch.cat([center, gs_batch], dim=1).contiguous()
     return pair_batch, mask
 
@@ -137,14 +141,58 @@ def accumulate_uz_reference(
         if has_inv:
             dx_inv, dy_inv = -dx, -dy
             wpad = F.pad(weight_fwd, (R, R, R, R), mode='circular')
-            w_inv = wpad[:, :, R + dx_inv:R + dx_inv + H, R + dy_inv:R + dy_inv + W]
-            cb_inv = box[:, :, R + dx_inv:R + dx_inv + H, R + dy_inv:R + dy_inv + W]
+            w_inv = wpad[:, :, R + dx_inv:R +
+                         dx_inv + H, R + dy_inv:R + dy_inv + W]
+            cb_inv = box[:, :, R + dx_inv:R +
+                         dx_inv + H, R + dy_inv:R + dy_inv + W]
             w_inv = w_inv * cb_inv
-            v_inv = padded_img[:, :, R + dx_inv:R + dx_inv + H, R + dy_inv:R + dy_inv + W]
+            v_inv = padded_img[:, :, R + dx_inv:R +
+                               dx_inv + H, R + dy_inv:R + dy_inv + W]
             U = U + w_inv * v_inv
             Z = Z + w_inv
 
     return U, Z
+
+
+def accumulate_uz_scalar_reference(
+    x: torch.Tensor,              # (B, C, H, W)
+    # (S, B, C) -- ONE scalar per (transform, image, channel)
+    weights: torch.Tensor,
+    shifts: torch.Tensor,         # (S, 2) translations, gather convention
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch reference for `accumulate_uz_scalar` (GASD accumulation).
+
+    Computes, with gather (not roll) shift convention matching `shift_gather`::
+
+        U[b, c, h, w] = sum_s weights[s, b, c] * x[b, c, (h+dx_s) % H, (w+dy_s) % W]
+        Z[b, c, h, w] = sum_s weights[s, b, c]                (constant over h, w)
+
+    This is the scalar-per-transform analogue of `accumulate_uz`: the weight is
+    constant over space, so it is never materialized as an (S*B, C, H, W)
+    tensor. There is no boundary mask (circular) and no inverse-symmetry branch
+    -- GASD's transforms are exact permutations and each carries its own
+    independent scalar weight.
+    """
+    if shifts.dim() != 2 or shifts.size(1) < 2:
+        raise ValueError(f"shifts must be (S, >=2); got {tuple(shifts.shape)}")
+    B, C, H, W = x.shape
+    S = shifts.size(0)
+    if weights.shape != (S, B, C):
+        raise ValueError(
+            f"weights must be (S, B, C)={ (S, B, C) }; got {tuple(weights.shape)}")
+
+    U = torch.zeros_like(x)
+    Z = x.new_zeros(B, C, 1, 1)
+    for s in range(S):
+        dx = int(shifts[s, 0].item())
+        dy = int(shifts[s, 1].item())
+        # gather x at (h+dx, w+dy) circular == roll by (-dx, -dy)
+        xs = x if (dx == 0 and dy == 0) else torch.roll(
+            x, shifts=(-dx, -dy), dims=(-2, -1))
+        w = weights[s].view(B, C, 1, 1)
+        U = U + w * xs
+        Z = Z + w
+    return U, Z.expand(B, C, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +201,8 @@ def accumulate_uz_reference(
 
 def _prep_shifts_for_cuda(shifts: torch.Tensor, device: torch.device) -> torch.Tensor:
     if shifts.dim() != 2 or shifts.size(1) not in (2, 3):
-        raise ValueError(f"shifts must be (S, 2) or (S, 3); got {tuple(shifts.shape)}")
+        raise ValueError(
+            f"shifts must be (S, 2) or (S, 3); got {tuple(shifts.shape)}")
     return shifts.to(device=device, dtype=torch.int32).contiguous()
 
 
@@ -216,6 +265,36 @@ class _AccumulateUZFn(torch.autograd.Function):
         return grad_x, grad_w, None
 
 
+def _has_scalar_ext() -> bool:
+    """The scalar-accumulate CUDA symbols are only present after a rebuild of
+    the 0.4.0 extension. Guard so an older compiled `_C` still imports and the
+    op transparently falls back to the tested PyTorch reference."""
+    return _HAS_CUDA_EXT and hasattr(_C, "accumulate_uz_scalar_forward")
+
+
+class _AccumulateUZScalarFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weights, shifts):
+        # x: (B, C, H, W); weights: (S, B, C); shifts: (S, 2) gather convention
+        if shifts.dim() != 2 or shifts.size(1) < 2:
+            raise ValueError(
+                "accumulate_uz_scalar requires shifts of shape (S, >=2)")
+        shifts_i = shifts[:, :2].to(
+            device=x.device, dtype=torch.int32).contiguous()
+        U, Z = _C.accumulate_uz_scalar_forward(
+            x.contiguous(), weights.contiguous(), shifts_i)
+        ctx.save_for_backward(x, weights, shifts_i)
+        return U, Z
+
+    @staticmethod
+    def backward(ctx, grad_U, grad_Z):
+        x, weights, shifts_i = ctx.saved_tensors
+        grad_x, grad_w = _C.accumulate_uz_scalar_backward(
+            x.contiguous(), weights.contiguous(),
+            grad_U.contiguous(), grad_Z.contiguous(), shifts_i)
+        return grad_x, grad_w, None
+
+
 # ---------------------------------------------------------------------------
 # Public API: dispatches CUDA vs reference based on device.
 # ---------------------------------------------------------------------------
@@ -271,11 +350,36 @@ def accumulate_uz(
     return accumulate_uz_reference(x, weights, shifts)
 
 
+def accumulate_uz_scalar(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    shifts: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Scalar-per-transform accumulation used by the GASD forward::
+
+        U[b, c, h, w] = sum_s weights[s, b, c] * x[b, c, (h+dx_s) % H, (w+dy_s) % W]
+        Z[b, c, h, w] = sum_s weights[s, b, c]
+
+    `weights` is (S, B, C) -- one positive scalar per (transform, image,
+    channel), NOT the (S*B, C, H, W) per-pixel tensor `accumulate_uz` takes.
+    `shifts` is (S, 2) in gather convention (same as `shift_gather`).
+
+    Returns (U_num, Z); the caller divides U = U_num / Z. Fully differentiable
+    w.r.t. both `x` and `weights`.
+    """
+    if x.is_cuda and _has_scalar_ext():
+        return _AccumulateUZScalarFn.apply(x, weights, shifts)
+    return accumulate_uz_scalar_reference(x, weights, shifts)
+
+
 __all__ = [
     "shift_gather",
     "pair_gather",
     "accumulate_uz",
+    "accumulate_uz_scalar",
     "shift_gather_reference",
     "pair_gather_reference",
     "accumulate_uz_reference",
+    "accumulate_uz_scalar_reference",
 ]
