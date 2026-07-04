@@ -502,38 +502,53 @@ __global__ void accumulate_uz_scalar_backward_w_kernel(
     int S, int B, int C, int H, int W,
     int shift_stride)
 {
-    // One thread per (s, b, c); reduce over the H*W grid.
+    // One BLOCK per (s, b, c); the block's threads cooperatively reduce the
+    // H*W grid via shared memory. This keeps occupancy high (S*B*C blocks *
+    // blockDim.x threads) instead of the old one-thread-per-(s,b,c) version,
+    // whose S*B*C threads each ran a serial H*W loop and left the GPU idle.
+    // Deterministic (tree reduction, no atomics). blockDim.x is a power of two.
     //   grad_w[s,b,c] = sum_{h,w} grad_U[b,c,h,w] * x[b,c,(h+dx)%H,(w+dy)%W]
     //                 + sum_{h,w} grad_Z[b,c,h,w]
-    const int M = S * B * C;
-    CUDA_KERNEL_LOOP(sbc, M) {
-        int c = sbc % C;
-        int t = sbc / C;
-        int b = t % B;
-        int s = t / B;
+    const int sbc = blockIdx.x;
+    if (sbc >= S * B * C) return;
 
-        const int dx = shifts[s * shift_stride + 0];
-        const int dy = shifts[s * shift_stride + 1];
-        const int base = (b * C + c) * H * W;
+    const int c = sbc % C;
+    int t = sbc / C;
+    const int b = t % B;
+    const int s = t / B;
 
-        scalar_t gw = scalar_t(0);
-        for (int h = 0; h < H; ++h) {
-            int sh = h + dx;
-            if (sh < 0)        sh += H;
-            else if (sh >= H)  sh -= H;
-            for (int w = 0; w < W; ++w) {
-                int sw = w + dy;
-                if (sw < 0)        sw += W;
-                else if (sw >= W)  sw -= W;
+    const int dx = shifts[s * shift_stride + 0];
+    const int dy = shifts[s * shift_stride + 1];
+    const int base = (b * C + c) * H * W;
+    const int HW = H * W;
 
-                const int o_idx = base + h * W + w;
-                const int x_idx = base + sh * W + sw;
-                gw += grad_U[o_idx] * x[x_idx];
-                gw += grad_Z[o_idx];
-            }
-        }
-        grad_w[sbc] = gw;
+    scalar_t local = scalar_t(0);
+    for (int p = threadIdx.x; p < HW; p += blockDim.x) {
+        const int h = p / W;
+        const int w = p - h * W;
+        int sh = h + dx;
+        if (sh < 0)        sh += H;
+        else if (sh >= H)  sh -= H;
+        int sw = w + dy;
+        if (sw < 0)        sw += W;
+        else if (sw >= W)  sw -= W;
+
+        const int o_idx = base + p;
+        const int x_idx = base + sh * W + sw;
+        local += grad_U[o_idx] * x[x_idx] + grad_Z[o_idx];
     }
+
+    extern __shared__ unsigned char smem_raw[];
+    scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            smem[threadIdx.x] += smem[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        grad_w[sbc] = smem[0];
 }
 
 } // anonymous namespace
@@ -776,7 +791,11 @@ void launch_accumulate_uz_scalar_backward(
             S, B, C, H, W, shift_stride);
     });
     AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "accumulate_uz_scalar_bwd_w", [&] {
-        accumulate_uz_scalar_backward_w_kernel<scalar_t><<<n_blocks(Mw), THREADS, 0, stream>>>(
+        // One block per (s, b, c); THREADS (a power of two) cooperatively
+        // reduce H*W in shared memory.
+        const int blocks = Mw;
+        const size_t smem = THREADS * sizeof(scalar_t);
+        accumulate_uz_scalar_backward_w_kernel<scalar_t><<<blocks, THREADS, smem, stream>>>(
             x.data_ptr<scalar_t>(),
             grad_U.data_ptr<scalar_t>(),
             grad_Z.data_ptr<scalar_t>(),
