@@ -97,7 +97,8 @@ torch::Tensor shift_gather_backward(
     CHECK_NCHW(grad_out);
     shifts = _prep_shifts(shifts.to(grad_out.device()));
 
-    auto grad_guide = torch::zeros({B, C, H, W}, grad_out.options());
+    // empty, not zeros: the gather-form backward kernel assigns every element.
+    auto grad_guide = torch::empty({B, C, H, W}, grad_out.options());
     launch_shift_gather_backward(grad_out, shifts, grad_guide);
     return grad_guide;
 }

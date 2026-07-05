@@ -154,27 +154,35 @@ __global__ void shift_gather_backward_kernel(
     int S, int B, int C, int H, int W,
     int shift_stride)
 {
-    const int N = S * B * C * H * W;
+    // Gather formulation (atomic-free, deterministic): each circular shift is
+    // a bijection, so guide[b,c,gh,gw] was read by exactly one output pixel
+    // per shift s, namely out[s,b,c,h,w] with h=(gh-dx) mod H, w=(gw-dy) mod W.
+    // One thread OWNS one grad_guide element and sums its S contributions.
+    // This replaces the old scatter version whose S*B*C*H*W atomicAdds
+    // contended S-to-1 on grad_guide and were nondeterministic.
+    const int N = B * C * H * W;
     CUDA_KERNEL_LOOP(idx, N) {
-        int w = idx % W;
+        int gw = idx % W;
         int t = idx / W;
-        int h = t % H;            t /= H;
-        int c = t % C;            t /= C;
-        int b = t % B;
-        int s = t / B;
+        int gh = t % H;           t /= H;
+        int c = t % C;
+        int b = t / C;
 
-        const int dx = shifts[s * shift_stride + 0];
-        const int dy = shifts[s * shift_stride + 1];
+        scalar_t acc = scalar_t(0);
+        for (int s = 0; s < S; ++s) {
+            const int dx = shifts[s * shift_stride + 0];
+            const int dy = shifts[s * shift_stride + 1];
 
-        int sh = h + dx;
-        if (sh < 0)        sh += H;
-        else if (sh >= H)  sh -= H;
-        int sw = w + dy;
-        if (sw < 0)        sw += W;
-        else if (sw >= W)  sw -= W;
+            int h = gh - dx;                      // |dx| < H: one correction
+            if (h < 0)        h += H;
+            else if (h >= H)  h -= H;
+            int w = gw - dy;
+            if (w < 0)        w += W;
+            else if (w >= W)  w -= W;
 
-        const int gidx = ((b * C + c) * H + sh) * W + sw;
-        atomicAdd(grad_guide + gidx, grad_out[idx]);
+            acc += grad_out[(((s * B + b) * C + c) * H + h) * W + w];
+        }
+        grad_guide[idx] = acc;
     }
 }
 
@@ -638,7 +646,7 @@ void launch_shift_gather_backward(
     const int shift_stride = shifts.size(1);
 
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int N = S * B * C * H * W;
+    const int N = B * C * H * W;   // gather form: one thread per guide element
     AT_DISPATCH_FLOATING_TYPES(grad_out.scalar_type(), "shift_gather_bwd", [&] {
         shift_gather_backward_kernel<scalar_t><<<n_blocks(N), THREADS, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),

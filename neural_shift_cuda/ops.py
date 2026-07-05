@@ -266,10 +266,32 @@ class _AccumulateUZFn(torch.autograd.Function):
 
 
 def _has_scalar_ext() -> bool:
-    """The scalar-accumulate CUDA symbols are only present after a rebuild of
-    the 0.4.0 extension. Guard so an older compiled `_C` still imports and the
-    op transparently falls back to the tested PyTorch reference."""
+    """The scalar-accumulate CUDA symbols are only present in 0.4.x+ builds of
+    the compiled extension."""
     return _HAS_CUDA_EXT and hasattr(_C, "accumulate_uz_scalar_forward")
+
+
+def _require_cuda_ext(op_name: str, need_scalar: bool = False) -> None:
+    # A CUDA tensor reaching a reference impl is a performance trap, not a
+    # graceful fallback: the references read (dx, dy) out of a *device* shifts
+    # tensor with .item() inside per-shift loops -- hundreds of full-stream
+    # synchronizations per forward (~245 for shift_gather + ~242 for
+    # accumulate_uz_scalar at R=5), which destroys CPU run-ahead and makes the
+    # "CUDA" path slower than the model's own torch.roll forward. Fail loudly
+    # instead so a stale binary is caught at the first call, not by a silent
+    # 2x training slowdown.
+    if not _HAS_CUDA_EXT:
+        raise RuntimeError(
+            f"neural_shift_cuda.{op_name}: input is on CUDA but the compiled "
+            f"extension `_C` failed to import. Rebuild it in THIS environment "
+            f"(pip install --no-build-isolation --force-reinstall .) and check "
+            f"for a stale in-tree _C*.so shadowing site-packages.")
+    if need_scalar and not hasattr(_C, "accumulate_uz_scalar_forward"):
+        raise RuntimeError(
+            f"neural_shift_cuda.{op_name}: the imported `_C` binary predates "
+            f"0.4.0 (no accumulate_uz_scalar symbols) -- a stale build is being "
+            f"picked up. `import neural_shift_cuda._C as C; print(C.__file__)` "
+            f"to locate it, then force-reinstall from the current source.")
 
 
 class _AccumulateUZScalarFn(torch.autograd.Function):
@@ -311,7 +333,8 @@ def shift_gather(
         gs[s*B + b, c, h, w] = guide[b, c, (h+dx_s) mod H, (w+dy_s) mod W]
         mask[s*B + b, 0, h, w] = 1 iff 0 <= h+dx_s < H and 0 <= w+dy_s < W
     """
-    if guide.is_cuda and _HAS_CUDA_EXT:
+    if guide.is_cuda:
+        _require_cuda_ext("shift_gather")
         return _ShiftGatherFn.apply(guide, shifts)
     return shift_gather_reference(guide, shifts)
 
@@ -328,7 +351,8 @@ def pair_gather(
         pair[s*B + b, :C, :, :]  = guide[b]
         pair[s*B + b, C:, :, :]  = shifted_guide_s[b]
     """
-    if guide.is_cuda and _HAS_CUDA_EXT:
+    if guide.is_cuda:
+        _require_cuda_ext("pair_gather")
         return _PairGatherFn.apply(guide, shifts)
     return pair_gather_reference(guide, shifts)
 
@@ -345,7 +369,8 @@ def accumulate_uz(
 
     Returns (U_num, Z). User divides: U = U_num / Z.
     """
-    if x.is_cuda and _HAS_CUDA_EXT:
+    if x.is_cuda:
+        _require_cuda_ext("accumulate_uz")
         return _AccumulateUZFn.apply(x, weights, shifts)
     return accumulate_uz_reference(x, weights, shifts)
 
@@ -368,7 +393,8 @@ def accumulate_uz_scalar(
     Returns (U_num, Z); the caller divides U = U_num / Z. Fully differentiable
     w.r.t. both `x` and `weights`.
     """
-    if x.is_cuda and _has_scalar_ext():
+    if x.is_cuda:
+        _require_cuda_ext("accumulate_uz_scalar", need_scalar=True)
         return _AccumulateUZScalarFn.apply(x, weights, shifts)
     return accumulate_uz_scalar_reference(x, weights, shifts)
 

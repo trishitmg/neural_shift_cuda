@@ -271,6 +271,13 @@ def install_cuda_shift(model_cls):
     if getattr(model_cls, "_cuda_shift_installed", False):
         return model_cls
 
+    # Fail at install time, not mid-training: if the compiled binary is stale
+    # (missing the 0.4.x scalar symbols) or failed to import, the ops layer
+    # would otherwise only raise on the first CUDA forward.
+    if torch.cuda.is_available():
+        from neural_shift_cuda.ops import _require_cuda_ext
+        _require_cuda_ext("install_cuda_shift[gasd]", need_scalar=True)
+
     original_forward = model_cls.forward
 
     def patched_forward(self, x, guide=None, sig=None):
