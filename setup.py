@@ -12,7 +12,7 @@ def _src(p):
 
 setup(
     name="neural_shift_cuda",
-    version="0.4.4",
+    version="0.4.5",
     description="CUDA shift-gather / pair-gather / accumulate (per-pixel and "
                 "scalar-per-transform) ops for NeKDe / GASD denoisers.",
     # picks up neural_shift_cuda/ and neural_shift_cuda/integration/
@@ -49,7 +49,20 @@ setup(
         )
     ],
     cmdclass={"build_ext": BuildExtension},
-    install_requires=["torch>=1.12"],
+    # torch is deliberately NOT in install_requires. This is a compiled torch
+    # extension: torch must already be importable to BUILD it (setup.py imports
+    # torch.utils.cpp_extension, and we build with --no-build-isolation against
+    # the ambient env). Listing it here does nothing useful on a normal install
+    # (the existing torch already satisfies any version spec) but is actively
+    # harmful with --force-reinstall, which reinstalls every declared dep and,
+    # against an unpinned spec, pulls the latest torch wheel -- overwriting a
+    # pinned CUDA build (e.g. 2.5.1+cu124) with a mismatched one. Omitting torch
+    # lets you drop the --no-deps guard:
+    #   pip install --no-build-isolation --force-reinstall "git+...".
+    # einops is only needed by the legacy nekre_patch, so it is an extra, not a
+    # core requirement (the GASD / NeKDe paths import only torch).
+    install_requires=[],
+    extras_require={"nekre": ["einops>=0.6"]},
     python_requires=">=3.8",
     zip_safe=False,
 )

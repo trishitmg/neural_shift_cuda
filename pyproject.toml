@@ -1,6 +1,9 @@
 [build-system]
-# torch must be importable at build time because setup.py imports
-# torch.utils.cpp_extension. Disabling build isolation (see install
-# instructions) is the simplest route; alternatively list torch here.
-requires = ["setuptools>=61", "wheel", "torch>=1.12"]
+# setup.py imports torch.utils.cpp_extension, so torch must be importable at
+# build time. The documented install uses --no-build-isolation, which builds
+# against the ambient env's (already-installed, CUDA-matched) torch, so torch
+# is intentionally NOT pinned here -- pinning it would let an isolated build
+# fetch a different torch than the one you run against. If you ever build WITH
+# isolation, add your exact torch (e.g. "torch==2.5.1") to this list yourself.
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
