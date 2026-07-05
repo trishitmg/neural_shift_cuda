@@ -10,7 +10,7 @@ from .ops import (
     accumulate_uz_scalar_reference,
 )
 from .metropolis import metropolis_aggregate
-__version__ = "0.4.6"
+__version__ = "0.5.0"
 __all__ = [
     "shift_gather",
     "pair_gather",

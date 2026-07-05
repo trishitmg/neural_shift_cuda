@@ -68,6 +68,7 @@ input is on a CUDA device. To disable per-instance:
 
 from __future__ import annotations
 
+import inspect
 from typing import List, Optional, Tuple
 
 import torch
@@ -156,7 +157,8 @@ def _forward_cuda(
     x: torch.Tensor,
     guide: Optional[torch.Tensor] = None,
     sig: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_D: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """CUDA-accelerated drop-in for ``GASDDRUNetAttn.forward``.
 
     Numerics: identical to the reference forward up to floating-point reduction
@@ -253,6 +255,8 @@ def _forward_cuda(
         Z = Z + w_g
 
     U = U / Z.clamp_min(1e-6)
+    if not return_D:
+        return U, None
     Z = Z.expand(B, C, H, W)
     return U, Z
 
@@ -280,11 +284,24 @@ def install_cuda_shift(model_cls):
 
     original_forward = model_cls.forward
 
-    def patched_forward(self, x, guide=None, sig=None):
+    # Derive return_D's default from the wrapped forward so the patched
+    # signature stays in lockstep with the model instead of hardcoding it, and
+    # only forward return_D to the reference path when that forward accepts it.
+    _fwd_sig = inspect.signature(original_forward)
+    _has_return_D = "return_D" in _fwd_sig.parameters
+    _return_D_default = (
+        _fwd_sig.parameters["return_D"].default if _has_return_D else False)
+
+    def patched_forward(self, x, guide=None, sig=None,
+                        return_D=_return_D_default):
         if not hasattr(self, "use_cuda_shift"):
             self.use_cuda_shift = True
         if getattr(self, "use_cuda_shift", True) and x.is_cuda:
-            return _forward_cuda(self, x, guide=guide, sig=sig)
+            return _forward_cuda(self, x, guide=guide, sig=sig,
+                                 return_D=return_D)
+        if _has_return_D:
+            return original_forward(self, x, guide=guide, sig=sig,
+                                    return_D=return_D)
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward

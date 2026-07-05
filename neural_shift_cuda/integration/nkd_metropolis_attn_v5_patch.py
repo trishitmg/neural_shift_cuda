@@ -27,6 +27,7 @@ Set ``model.use_cuda_shift = False`` to force the reference PyTorch path.
 
 from __future__ import annotations
 
+import inspect
 from typing import List, Optional, Tuple
 
 import torch
@@ -83,7 +84,8 @@ def _forward_cuda(
     x: torch.Tensor,
     guide: Optional[torch.Tensor] = None,
     sig: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_D: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """``forward`` via the fused symmetric Metropolis op.
 
     Returns ``(W_x, degree_hat)`` exactly as the reference ``forward``.
@@ -94,7 +96,9 @@ def _forward_cuda(
     eps = max(self.metropolis_eps, torch.finfo(x.dtype).tiny)
     Wx, degree_hat = metropolis_aggregate(
         w_half, x, shifts, use_box=_USE_BOX, eps=eps)
-    return Wx, degree_hat
+    if return_D:
+        return Wx, degree_hat
+    return Wx, None
 
 
 def install_cuda_shift(model_cls):
@@ -112,11 +116,24 @@ def install_cuda_shift(model_cls):
 
     original_forward = model_cls.forward
 
-    def patched_forward(self, x, guide=None, sig=None):
+    # Derive return_D's default from the wrapped forward so the patched
+    # signature stays in lockstep with the model instead of hardcoding it, and
+    # only forward return_D to the reference path when that forward accepts it.
+    _fwd_sig = inspect.signature(original_forward)
+    _has_return_D = "return_D" in _fwd_sig.parameters
+    _return_D_default = (
+        _fwd_sig.parameters["return_D"].default if _has_return_D else False)
+
+    def patched_forward(self, x, guide=None, sig=None,
+                        return_D=_return_D_default):
         if not hasattr(self, "use_cuda_shift"):
             self.use_cuda_shift = True
         if self.use_cuda_shift and x.is_cuda:
-            return _forward_cuda(self, x, guide=guide, sig=sig)
+            return _forward_cuda(self, x, guide=guide, sig=sig,
+                                 return_D=return_D)
+        if _has_return_D:
+            return original_forward(self, x, guide=guide, sig=sig,
+                                    return_D=return_D)
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward

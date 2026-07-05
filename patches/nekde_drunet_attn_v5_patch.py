@@ -51,6 +51,7 @@ path when the input is on a CUDA device. To disable per-instance:
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional, Tuple, List
 
 import torch
@@ -126,7 +127,8 @@ def _forward_cuda(
     x: torch.Tensor,
     guide: Optional[torch.Tensor] = None,
     sig: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_D: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """CUDA-accelerated drop-in replacement for v5 NeKDeDRUNetAttn.forward.
 
     Numerics: identical to the v5 reference forward up to floating-point
@@ -234,7 +236,9 @@ def _forward_cuda(
     if not self.training:
         self.max_batch_shifts = None
 
-    return U, Z
+    if return_D:
+        return U, Z
+    return U, None
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +257,16 @@ def install_cuda_shift(model_cls):
     model_cls._get_shift_tensor = _get_shift_tensor
     original_forward = model_cls.forward
 
-    def patched_forward(self, x, guide=None, sig=None):
+    # Derive return_D's default from the wrapped forward so the patched
+    # signature stays in lockstep with the model instead of hardcoding it, and
+    # only forward return_D to the reference path when that forward accepts it.
+    _fwd_sig = inspect.signature(original_forward)
+    _has_return_D = "return_D" in _fwd_sig.parameters
+    _return_D_default = (
+        _fwd_sig.parameters["return_D"].default if _has_return_D else True)
+
+    def patched_forward(self, x, guide=None, sig=None,
+                        return_D=_return_D_default):
         # Lazy-init cache fields so we don't need to touch __init__.
         if not hasattr(self, "_cached_shift_tensor"):
             self.use_cuda_shift = True
@@ -261,7 +274,11 @@ def install_cuda_shift(model_cls):
             self._cached_shift_device = None
 
         if getattr(self, "use_cuda_shift", True) and x.is_cuda:
-            return _forward_cuda(self, x, guide=guide, sig=sig)
+            return _forward_cuda(self, x, guide=guide, sig=sig,
+                                 return_D=return_D)
+        if _has_return_D:
+            return original_forward(self, x, guide=guide, sig=sig,
+                                    return_D=return_D)
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward

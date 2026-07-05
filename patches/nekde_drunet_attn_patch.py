@@ -52,6 +52,7 @@ the CUDA path. To disable per-instance:
 
 from __future__ import annotations
 
+import inspect
 from typing import Optional, Tuple, List
 
 import torch
@@ -70,12 +71,27 @@ def _get_shift_tensor(self, device: torch.device) -> torch.Tensor:
     """Cache the (S, 3) int32 shift tensor on `device`."""
     if (getattr(self, "_cached_shift_tensor", None) is None
             or self._cached_shift_device != device):
-        shifts = self._collect_shifts()              # [(dx, dy, has_inverse), ...]
+        # [(dx, dy, has_inverse), ...]
+        shifts = self._collect_shifts()
         rows = [(int(dx), int(dy), int(bool(hi))) for (dx, dy, hi) in shifts]
         self._cached_shift_tensor = torch.tensor(
             rows, dtype=torch.int32, device=device)
         self._cached_shift_device = device
     return self._cached_shift_tensor
+
+
+def _head_mix_mat(self) -> Optional[torch.Tensor]:
+    """Build the (C, n_heads) head-mixing matrix using the model's own
+    `head_mix_pos_act`. Matches NeKDeDRUNetAttn.forward exactly; defaults to
+    'softmax' for instances that lack the attribute (e.g. v3/v4)."""
+    if self.raw_head_mix is None:
+        return None
+    act = getattr(self, "head_mix_pos_act", "softmax")
+    if act == "softmax":
+        return F.softmax(self.raw_head_mix, dim=1)
+    if act == "softplus":
+        return F.softplus(self.raw_head_mix)
+    return F.relu(self.raw_head_mix)
 
 
 def _mix_heads_vec(
@@ -113,7 +129,8 @@ def _forward_cuda(
     x: torch.Tensor,
     guide: Optional[torch.Tensor] = None,
     sig: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_D: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """CUDA-accelerated drop-in replacement for NeKDeDRUNetAttn.forward.
 
     Numerics: identical to the original up to floating-point reduction
@@ -145,11 +162,8 @@ def _forward_cuda(
     S = shifts_t.shape[0]
     chunk = self.max_batch_shifts if self.max_batch_shifts is not None else S
 
-    # ---- Head-mixing matrix ----
-    head_mix_mat = (
-        F.softmax(self.raw_head_mix, dim=1)
-        if self.raw_head_mix is not None else None
-    )
+    # ---- Head-mixing matrix (respects head_mix_pos_act; defaults to softmax) ----
+    head_mix_mat = _head_mix_mat(self)
 
     # ------------------------------------------------------------------
     # Per-chunk weight computation.
@@ -165,7 +179,8 @@ def _forward_cuda(
     # The mask tiles are concatenated outside the loop -- we need the
     # full (S*B, 1, H, W) mask for the accumulator.
     # ------------------------------------------------------------------
-    weight_tiles: List[torch.Tensor] = []   # logits or weights depending on path
+    # logits or weights depending on path
+    weight_tiles: List[torch.Tensor] = []
     mask_tiles: List[torch.Tensor] = []
 
     for start in range(0, S, chunk):
@@ -173,7 +188,8 @@ def _forward_cuda(
         n = end - start
         shifts_chunk = shifts_xy[start:end]                      # (n, 2) int32
 
-        phi_s_batch, mask_chunk = shift_gather(phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
+        phi_s_batch, mask_chunk = shift_gather(
+            phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
         phi_c_batch = phi.repeat(n, 1, 1, 1)
         sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
 
@@ -203,10 +219,12 @@ def _forward_cuda(
         # Stack: (B, S, n_heads, H, W)
         logits = torch.stack(weight_tiles, dim=1)
         logits = logits - logits.amax(dim=1, keepdim=True)
-        w_per_shift = F.softmax(logits, dim=1)                   # (B, S, n_heads, H, W)
+        # (B, S, n_heads, H, W)
+        w_per_shift = F.softmax(logits, dim=1)
     else:
         # Already positive; just stack.
-        w_per_shift = torch.stack(weight_tiles, dim=1)           # (B, S, n_heads, H, W)
+        # (B, S, n_heads, H, W)
+        w_per_shift = torch.stack(weight_tiles, dim=1)
 
     # Reorder to shift-major to match shift_gather/accumulate_uz convention.
     # (B, S, h, H, W) -> (S, B, h, H, W)
@@ -217,7 +235,8 @@ def _forward_cuda(
 
     # Flatten to (S*B, C, H, W) and apply forward validity mask.
     w_all = w_stack.view(S * B, C, H, W)
-    mask_all = torch.cat(mask_tiles, dim=0)                      # (S*B, 1, H, W)
+    # (S*B, 1, H, W)
+    mask_all = torch.cat(mask_tiles, dim=0)
     w_all = (w_all * mask_all).contiguous()
 
     # ---- Single fused U/Z accumulation (forward + inverse symmetry) ----
@@ -227,7 +246,9 @@ def _forward_cuda(
     if not self.training:
         self.max_batch_shifts = None
 
-    return U, Z
+    if return_D:
+        return U, Z
+    return U, None
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +268,17 @@ def install_cuda_shift(model_cls):
     model_cls._get_shift_tensor = _get_shift_tensor
     original_forward = model_cls.forward
 
-    def patched_forward(self, x, guide=None, sig=None):
+    # Derive return_D's default from the wrapped forward so the patched
+    # signature stays in lockstep with the model (v2/v3/v4) instead of
+    # hardcoding it, and only forward return_D to the reference path when that
+    # forward actually accepts it.
+    _fwd_sig = inspect.signature(original_forward)
+    _has_return_D = "return_D" in _fwd_sig.parameters
+    _return_D_default = (
+        _fwd_sig.parameters["return_D"].default if _has_return_D else True)
+
+    def patched_forward(self, x, guide=None, sig=None,
+                        return_D=_return_D_default):
         # Lazy-init cache fields so we don't need to touch __init__.
         if not hasattr(self, "_cached_shift_tensor"):
             self.use_cuda_shift = True
@@ -255,7 +286,11 @@ def install_cuda_shift(model_cls):
             self._cached_shift_device = None
 
         if getattr(self, "use_cuda_shift", True) and x.is_cuda:
-            return _forward_cuda(self, x, guide=guide, sig=sig)
+            return _forward_cuda(self, x, guide=guide, sig=sig,
+                                 return_D=return_D)
+        if _has_return_D:
+            return original_forward(self, x, guide=guide, sig=sig,
+                                    return_D=return_D)
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward
