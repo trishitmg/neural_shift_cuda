@@ -24,9 +24,15 @@ import torch.nn.functional as F
 try:
     from neural_shift_cuda import _C
     _HAS_CUDA_EXT = True
-except Exception:  # pragma: no cover -- CPU-only env / build failure
+    _EXT_IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover -- CPU-only env / build failure
     _C = None
     _HAS_CUDA_EXT = False
+    # Keep the real exception (missing .so, torch-ABI undefined-symbol, missing
+    # libcudart, ...) so _require_cuda_ext can surface the actual cause instead
+    # of a generic "failed to import". A bare except that drops this is what
+    # made the fallback silent in the first place.
+    _EXT_IMPORT_ERROR = _e
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +291,10 @@ def _require_cuda_ext(op_name: str, need_scalar: bool = False) -> None:
             f"neural_shift_cuda.{op_name}: input is on CUDA but the compiled "
             f"extension `_C` failed to import. Rebuild it in THIS environment "
             f"(pip install --no-build-isolation --force-reinstall .) and check "
-            f"for a stale in-tree _C*.so shadowing site-packages.")
+            f"for a stale in-tree _C*.so shadowing site-packages.\n"
+            f"  Underlying import error: "
+            f"{type(_EXT_IMPORT_ERROR).__name__}: {_EXT_IMPORT_ERROR}"
+        ) from _EXT_IMPORT_ERROR
     if need_scalar and not hasattr(_C, "accumulate_uz_scalar_forward"):
         raise RuntimeError(
             f"neural_shift_cuda.{op_name}: the imported `_C` binary predates "
