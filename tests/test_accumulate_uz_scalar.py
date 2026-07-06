@@ -63,6 +63,36 @@ def test_reference_gradcheck():
     assert torch.autograd.gradcheck(f, (x, w), atol=1e-6, rtol=1e-4)
 
 
+def test_per_transform_matches_expanded():
+    # (S, B) weights (one scalar per transform, updated GASD layout) must be
+    # exactly equivalent to the same scalars expanded to (S, B, C).
+    torch.manual_seed(3)
+    B, C, H, W, R = 2, 3, 11, 9, 2
+    shifts = _window_shifts(R)
+    S = shifts.size(0)
+    x = torch.randn(B, C, H, W, dtype=torch.double)
+    w_sb = torch.rand(S, B, dtype=torch.double) + 0.1
+    U1, Z1 = accumulate_uz_scalar_reference(x, w_sb, shifts)
+    U2, Z2 = accumulate_uz_scalar_reference(
+        x, w_sb.unsqueeze(-1).expand(S, B, C), shifts)
+    assert torch.equal(U1, U2)
+    assert torch.equal(Z1, Z2)
+
+
+def test_per_transform_gradcheck():
+    torch.manual_seed(4)
+    B, C, H, W, R = 1, 2, 7, 7, 1
+    shifts = _window_shifts(R)
+    S = shifts.size(0)
+    x = torch.randn(B, C, H, W, dtype=torch.double, requires_grad=True)
+    w = (torch.rand(S, B, dtype=torch.double) + 0.1).requires_grad_(True)
+
+    def f(xx, ww):
+        return accumulate_uz_scalar_reference(xx, ww, shifts)
+
+    assert torch.autograd.gradcheck(f, (x, w), atol=1e-6, rtol=1e-4)
+
+
 def test_shape_validation():
     x = torch.randn(2, 3, 8, 8)
     shifts = _window_shifts(1)
@@ -71,6 +101,10 @@ def test_shape_validation():
         accumulate_uz_scalar_reference(x, torch.rand(S, 2, 4), shifts)  # wrong C
     with pytest.raises(ValueError):
         accumulate_uz_scalar_reference(x, torch.rand(S + 1, 2, 3), shifts)  # wrong S
+    with pytest.raises(ValueError):
+        accumulate_uz_scalar_reference(x, torch.rand(S, 4), shifts)  # wrong B
+    with pytest.raises(ValueError):
+        accumulate_uz_scalar_reference(x, torch.rand(S + 1, 2), shifts)  # wrong S
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not _has_scalar_ext(),
@@ -98,4 +132,34 @@ def test_cuda_matches_reference():
     (Uc * g).sum().backward()
     (Ur * g.cpu()).sum().backward()
     assert torch.allclose(xc.grad.cpu(), xr.grad, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not _has_scalar_ext(),
+                    reason="CUDA build with 0.4.0 scalar symbols required")
+def test_cuda_matches_reference_per_transform():
+    # (S, B) weights on CUDA (routed through the (S, B, C) kernel via a
+    # Python-level expand) vs the CPU reference, forward + both grads.
+    torch.manual_seed(5)
+    B, C, H, W, R = 2, 3, 16, 16, 3
+    shifts = _window_shifts(R)
+    S = shifts.size(0)
+    x = torch.randn(B, C, H, W, device="cuda", dtype=torch.double)
+    w = (torch.rand(S, B, device="cuda", dtype=torch.double) + 0.1)
+
+    xc = x.clone().requires_grad_(True)
+    wc = w.clone().requires_grad_(True)
+    xr = x.clone().cpu().requires_grad_(True)
+    wr = w.clone().cpu().requires_grad_(True)
+
+    Uc, Zc = accumulate_uz_scalar(xc, wc, shifts)                    # CUDA
+    Ur, Zr = accumulate_uz_scalar_reference(xr, wr, shifts.cpu())    # reference
+
+    assert torch.allclose(Uc.cpu(), Ur, atol=1e-10)
+    assert torch.allclose(Zc.cpu(), Zr, atol=1e-10)
+
+    g = torch.randn_like(Uc)
+    (Uc * g).sum().backward()
+    (Ur * g.cpu()).sum().backward()
+    assert torch.allclose(xc.grad.cpu(), xr.grad, atol=1e-10)
+    assert torch.allclose(wc.grad.cpu(), wr.grad, atol=1e-10)
     assert torch.allclose(wc.grad.cpu(), wr.grad, atol=1e-4)

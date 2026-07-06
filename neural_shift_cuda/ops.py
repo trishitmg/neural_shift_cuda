@@ -160,9 +160,35 @@ def accumulate_uz_reference(
     return U, Z
 
 
+def _broadcast_scalar_weights(
+    weights: torch.Tensor, S: int, B: int, C: int,
+) -> torch.Tensor:
+    """Normalize accumulate_uz_scalar weights to (S, B, C).
+
+    Accepted shapes:
+        (S, B)    -- ONE scalar per transform (updated GASD: the same weight
+                     broadcasts over every channel). Expanded to (S, B, C);
+                     autograd through the expand sums grad over C, which is the
+                     exact gradient of a channel-shared scalar.
+        (S, B, C) -- one scalar per (transform, image, channel) (legacy layout,
+                     kept so existing callers/tests keep working).
+    """
+    if weights.dim() == 2:
+        if weights.shape != (S, B):
+            raise ValueError(
+                f"weights must be (S, B)={(S, B)} or (S, B, C)={(S, B, C)}; "
+                f"got {tuple(weights.shape)}")
+        return weights.unsqueeze(-1).expand(S, B, C)
+    if weights.shape != (S, B, C):
+        raise ValueError(
+            f"weights must be (S, B)={(S, B)} or (S, B, C)={(S, B, C)}; "
+            f"got {tuple(weights.shape)}")
+    return weights
+
+
 def accumulate_uz_scalar_reference(
     x: torch.Tensor,              # (B, C, H, W)
-    # (S, B, C) -- ONE scalar per (transform, image, channel)
+    # (S, B) -- ONE scalar per transform (broadcast over C), or (S, B, C)
     weights: torch.Tensor,
     shifts: torch.Tensor,         # (S, 2) translations, gather convention
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -173,19 +199,18 @@ def accumulate_uz_scalar_reference(
         U[b, c, h, w] = sum_s weights[s, b, c] * x[b, c, (h+dx_s) % H, (w+dy_s) % W]
         Z[b, c, h, w] = sum_s weights[s, b, c]                (constant over h, w)
 
-    This is the scalar-per-transform analogue of `accumulate_uz`: the weight is
-    constant over space, so it is never materialized as an (S*B, C, H, W)
-    tensor. There is no boundary mask (circular) and no inverse-symmetry branch
-    -- GASD's transforms are exact permutations and each carries its own
-    independent scalar weight.
+    `weights` may be (S, B) -- one scalar per transform, the updated GASD
+    layout, broadcast over channels -- or the legacy (S, B, C) per-channel
+    layout. The weight is constant over space either way, so it is never
+    materialized as an (S*B, C, H, W) tensor. There is no boundary mask
+    (circular) and no inverse-symmetry branch -- GASD's transforms are exact
+    permutations and each carries its own independent scalar weight.
     """
     if shifts.dim() != 2 or shifts.size(1) < 2:
         raise ValueError(f"shifts must be (S, >=2); got {tuple(shifts.shape)}")
     B, C, H, W = x.shape
     S = shifts.size(0)
-    if weights.shape != (S, B, C):
-        raise ValueError(
-            f"weights must be (S, B, C)={ (S, B, C) }; got {tuple(weights.shape)}")
+    weights = _broadcast_scalar_weights(weights, S, B, C)
 
     U = torch.zeros_like(x)
     Z = x.new_zeros(B, C, 1, 1)
@@ -195,7 +220,7 @@ def accumulate_uz_scalar_reference(
         # gather x at (h+dx, w+dy) circular == roll by (-dx, -dy)
         xs = x if (dx == 0 and dy == 0) else torch.roll(
             x, shifts=(-dx, -dy), dims=(-2, -1))
-        w = weights[s].view(B, C, 1, 1)
+        w = weights[s].reshape(B, C, 1, 1)
         U = U + w * xs
         Z = Z + w
     return U, Z.expand(B, C, H, W)
@@ -392,18 +417,32 @@ def accumulate_uz_scalar(
     """
     Scalar-per-transform accumulation used by the GASD forward::
 
-        U[b, c, h, w] = sum_s weights[s, b, c] * x[b, c, (h+dx_s) % H, (w+dy_s) % W]
-        Z[b, c, h, w] = sum_s weights[s, b, c]
+        U[b, c, h, w] = sum_s w[s, b, c] * x[b, c, (h+dx_s) % H, (w+dy_s) % W]
+        Z[b, c, h, w] = sum_s w[s, b, c]
 
-    `weights` is (S, B, C) -- one positive scalar per (transform, image,
-    channel), NOT the (S*B, C, H, W) per-pixel tensor `accumulate_uz` takes.
+    `weights` is (S, B) -- ONE positive scalar per transform, the updated GASD
+    layout, broadcast across channels -- or the legacy (S, B, C) per-channel
+    layout. Never the (S*B, C, H, W) per-pixel tensor `accumulate_uz` takes.
     `shifts` is (S, 2) in gather convention (same as `shift_gather`).
 
-    Returns (U_num, Z); the caller divides U = U_num / Z. Fully differentiable
-    w.r.t. both `x` and `weights`.
+    Returns (U_num, Z). When the weights are normalized over the transform
+    axis (sum_s w_s = 1, as GASD's `_finalize_weights` guarantees), Z is
+    identically one and the caller can ignore it. Fully differentiable w.r.t.
+    both `x` and `weights`.
+
+    The (S, B) case is handled by an `expand` to (S, B, C) IN PYTHON before
+    the autograd Function rather than by a dedicated kernel path: the weight
+    tensor is tiny (S*B*C floats), the expand's backward is the exact
+    channel-sum gradient of a shared scalar, and it reuses the bit-exact
+    validated (S, B, C) kernels without a rebuild.
     """
     if x.is_cuda:
         _require_cuda_ext("accumulate_uz_scalar", need_scalar=True)
+        if shifts.dim() != 2 or shifts.size(1) < 2:
+            raise ValueError(
+                "accumulate_uz_scalar requires shifts of shape (S, >=2)")
+        B, C = x.shape[0], x.shape[1]
+        weights = _broadcast_scalar_weights(weights, shifts.size(0), B, C)
         return _AccumulateUZScalarFn.apply(x, weights, shifts)
     return accumulate_uz_scalar_reference(x, weights, shifts)
 

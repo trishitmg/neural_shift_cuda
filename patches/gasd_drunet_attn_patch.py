@@ -1,48 +1,54 @@
 """
-Integration patch for GASDDRUNetAttn (GASD_drunet_attn_v2) to use
+Integration patch for GASDDRUNetAttn (GASD_drunet_attn_v2 / _v5) to use
 neural_shift_cuda kernels.
 
 What this is
 ------------
-A drop-in replacement for the `forward` method of `GASDDRUNetAttn` (the class
-formerly named `NeKDeDRUNetAttn`; the alias still resolves, so this patch
-installs on either name). Same math, same gradients, but:
+A drop-in replacement for the `forward` method of `GASDDRUNetAttn`, matched to
+the ONE-WEIGHT-PER-TRANSFORM architecture: the head's per-pixel map is
+head-mixed to C channels (still per-pixel), pooled over (C, H, W) to a single
+scalar per transform, normalized over the transform axis by the model's
+`_finalize_weights`, and the forward is the exactly-stochastic average
+W x = sum_g alpha_g P_g x with NO degree-map Z accumulation or division
+(sum_g alpha_g = 1 by construction, so Z is identically one).
+
+Same math, same gradients as the reference forward, but:
 
   * the per-transform feature gather ``torch.cat([g.apply(phi) for g ...])``
     inside ``_transform_weights`` is replaced, for the TRANSLATION transforms,
     by a single ``shift_gather`` CUDA kernel per chunk (no per-shift
     ``torch.roll`` and no ``torch.cat``);
-  * the scalar-weighted accumulation loop ``U += w_g * P_g x`` / ``Z += w_g``
-    in ``forward`` is replaced, for the TRANSLATION transforms, by a single
-    fused ``accumulate_uz_scalar`` call (weights stay (S, B, C) scalars -- they
-    are never broadcast to an (S*B, C, H, W) tensor).
+  * the scalar-weighted accumulation loop ``U += alpha_g * P_g x`` in
+    ``forward`` is replaced, for the TRANSLATION transforms, by a single fused
+    ``accumulate_uz_scalar`` call with (St, B) weights -- one scalar per
+    transform, broadcast over channels, never materialized per-pixel. The
+    kernel's Z output is discarded (it is sum_g alpha_g restricted to the
+    translation subset, not needed since there is no division).
 
 D4 transforms (``rot90``/``flip``/``transpose`` ...) are index permutations, not
 translations, so they are handled with the model's own ``g.apply`` in a small
-torch pass (at most 8 of them). The two partial (U, Z) are summed. Transform
-ordering is preserved so ``alpha[:, idx]`` still lines up with
-``self.transforms[idx]``.
+torch pass (at most 8 of them). Transform ordering is preserved so
+``w[:, idx]`` still lines up with ``self.transforms[idx]``.
+
+Model-owned pieces
+------------------
+Head calls (``attn_head.logit`` / ``attn_head.weight``), head mixing
+(``self._mix_heads`` with ``self._head_mix_mat()``), scalar pooling
+(``self._pool_to_scalar``), the control-sigmoid clamp and the transform-axis
+normalization (``self._finalize_weights``) are all invoked on the model itself,
+so any change to those stays in sync automatically. The per-chunk pipeline
+mirrors ``_transform_weights`` exactly: head -> _mix_heads (per-pixel) ->
+_pool_to_scalar; head-mix BEFORE pooling matters for n_heads > 1 and for
+'sum'/'max' pooling, where the two orders do not commute.
 
 max_batch_shifts / gradient checkpointing
 -----------------------------------------
 Both are honoured HERE, exactly as the reference ``_transform_weights`` does:
   * ``self.max_batch_shifts`` chunks the head evaluation (translations AND D4)
-    so peak activation memory is bounded by the chunk, not by S. Because GASD
-    pools each affinity map to a SCALAR before stacking, the cross-transform
-    stack is only (B, S, n_heads, 1, 1) -- there is no (B, S, n_heads, H, W)
-    materialization, so chunking actually bounds memory here (unlike the old
-    per-pixel softmax path).
+    so peak activation memory is bounded by the chunk, not by S.
   * ``self.use_grad_checkpoint`` wraps each per-chunk head call in
-    ``torch.utils.checkpoint`` (``use_reentrant=False``), so head activations
-    are recomputed in backward instead of being stored.
-
-What this is NOT
-----------------
-This does not touch ``AttentionWeightHead``. Its ``logit`` / ``weight`` methods
-take ``phi_c`` and ``phi_s`` as SEPARATE tensors, so ``pair_gather`` (channel
-concat fusion) does not apply. Pooling (``self._spatial_pool``) and head mixing
-(``self._mix_heads``) are called on the model itself, so any change to those
-stays in sync automatically.
+    ``torch.utils.checkpoint`` (``use_reentrant=False``); mixing and pooling
+    stay outside the checkpoint, as in the reference.
 
 Shift convention
 ----------------
@@ -56,7 +62,7 @@ accumulate, so each transform index maps to the same permutation on both sides.
 
 Usage
 -----
-    from GASD_drunet_attn_v2 import GASDDRUNetAttn      # or NeKDeDRUNetAttn alias
+    from GASD_drunet_attn_v2 import GASDDRUNetAttn      # or the v5 file
     from gasd_drunet_attn_patch import install_cuda_shift
     install_cuda_shift(GASDDRUNetAttn)
 
@@ -72,7 +78,6 @@ import inspect
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from neural_shift_cuda import shift_gather, accumulate_uz_scalar
@@ -87,33 +92,6 @@ def _run_head(head_fn, phi_c, phi_s, sig, use_ckpt):
     if use_ckpt:
         return grad_checkpoint(head_fn, phi_c, phi_s, sig, use_reentrant=False)
     return head_fn(phi_c, phi_s, sig)
-
-
-def _head_mix_mat(self) -> Optional[torch.Tensor]:
-    """(C, n_heads) head-mixing matrix, using the model's own
-    ``head_mix_pos_act`` (defaults to 'softmax')."""
-    if self.raw_head_mix is None:
-        return None
-    act = getattr(self, "head_mix_pos_act", "softmax")
-    if act == "softmax":
-        return F.softmax(self.raw_head_mix, dim=1)
-    if act == "softplus":
-        return F.softplus(self.raw_head_mix)
-    return F.relu(self.raw_head_mix)
-
-
-def _normalize_transform_weights(self, aff: torch.Tensor) -> torch.Tensor:
-    """Normalize stacked scalars (B, S, n_heads, 1, 1) over the transform axis.
-    Mirrors ``GASDDRUNetAttn._transform_weights`` tail exactly."""
-    if not self.normalize_transform_weights:
-        if self.output_activation != "softmax":
-            return aff.clamp_min(1e-8)
-    if self.output_activation == "softmax":
-        aff = aff - aff.amax(dim=1, keepdim=True)
-        return torch.softmax(aff, dim=1)
-    eps = 1e-8
-    aff = aff.clamp_min(eps)
-    return aff / aff.sum(dim=1, keepdim=True).clamp_min(eps)
 
 
 def _gasd_transform_partition(self):
@@ -159,7 +137,8 @@ def _forward_cuda(
     sig: Optional[torch.Tensor] = None,
     return_D: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """CUDA-accelerated drop-in for ``GASDDRUNetAttn.forward``.
+    """CUDA-accelerated drop-in for ``GASDDRUNetAttn.forward``
+    (one-weight-per-transform architecture).
 
     Numerics: identical to the reference forward up to floating-point reduction
     order (~1e-5 fp32, exact fp64).
@@ -191,9 +170,12 @@ def _forward_cuda(
     head_fn = (self.attn_head.logit
                if self.output_activation == "softmax"
                else self.attn_head.weight)
+    head_mix_mat = self._head_mix_mat()
 
-    # Scalar weight tile (B, n_heads, 1, 1) per transform, placed by orig index.
-    alpha_tiles: List[Optional[torch.Tensor]] = [None] * S
+    # ONE scalar tile (B, 1, 1, 1) per transform, placed by orig index.
+    # Per-chunk pipeline mirrors _transform_weights: head -> _mix_heads
+    # (per-pixel, heads -> C channels) -> _pool_to_scalar over (C, H, W).
+    scalar_tiles: List[Optional[torch.Tensor]] = [None] * S
 
     # ---- (a) translation transforms: shift_gather + chunked head ----
     trans_shifts = _gasd_trans_shifts(self, trans_meta, x.device)   # (St, 2) int32
@@ -208,9 +190,10 @@ def _forward_cuda(
 
         m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
                       self.use_grad_checkpoint)                     # (n*B, h, H, W)
-        m = self._spatial_pool(m)                                  # (n*B, h, 1, 1)
+        m = self._mix_heads(m, C, head_mix_mat)                    # (n*B, C, H, W)
+        m = self._pool_to_scalar(m)                                # (n*B, 1, 1, 1)
         for j, tile in enumerate(m.split(B, dim=0)):
-            alpha_tiles[trans_meta[start + j][0]] = tile
+            scalar_tiles[trans_meta[start + j][0]] = tile
 
     # ---- (b) D4 / other transforms: torch permutation + chunked head ----
     for start in range(0, len(other_meta), chunk):
@@ -222,43 +205,41 @@ def _forward_cuda(
 
         m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
                       self.use_grad_checkpoint)
-        m = self._spatial_pool(m)
+        m = self._mix_heads(m, C, head_mix_mat)
+        m = self._pool_to_scalar(m)
         for j, tile in enumerate(m.split(B, dim=0)):
-            alpha_tiles[grp[j][0]] = tile
+            scalar_tiles[grp[j][0]] = tile
 
-    aff = torch.stack(alpha_tiles, dim=1)                          # (B, S, h, 1, 1)
-    alpha = _normalize_transform_weights(self, aff)                # (B, S, h, 1, 1)
+    aff = torch.stack(scalar_tiles, dim=1)                         # (B, S, 1, 1, 1)
 
-    head_mix_mat = _head_mix_mat(self)
+    # Raw scores exactly as _transform_weights returns them: raw logits for
+    # 'softmax', clamped positive affinities for 'control_sigmoid'; then the
+    # model's own transform-axis normalization (sum_g w_g = 1).
+    raw = aff if self.output_activation == "softmax" else aff.clamp_min(1e-8)
+    w = self._finalize_weights(raw)                                # (B, S, 1, 1, 1)
 
     # ------------------------------------------------------------------
-    # Accumulation: U = sum_g w_g P_g x, Z = sum_g w_g (w_g scalar over space).
-    #   translations -> fused accumulate_uz_scalar (weights stay (St, B, C))
-    #   D4 / other    -> torch scalar-weighted permutation accumulate
+    # Group-averaged accumulation: U = sum_g w_g P_g x, sum_g w_g = 1.
+    #   translations -> fused accumulate_uz_scalar with (St, B) weights
+    #                   (one scalar per transform, broadcast over C); the
+    #                   kernel's Z output is discarded -- no division.
+    #   D4 / other    -> torch scalar-weighted permutation accumulate.
     # ------------------------------------------------------------------
     U = torch.zeros_like(x)
-    Z = torch.zeros_like(x)
 
     if St > 0:
-        w_list = []
-        for (orig_idx, _dx, _dy) in trans_meta:
-            w_g = self._mix_heads(alpha[:, orig_idx], C, head_mix_mat)  # (B, C, 1, 1)
-            w_list.append(w_g.reshape(B, C))
-        w_trans = torch.stack(w_list, dim=0).contiguous()             # (St, B, C)
-        U_t, Z_t = accumulate_uz_scalar(x.contiguous(), w_trans, trans_shifts)
+        trans_idx = [orig_idx for (orig_idx, _dx, _dy) in trans_meta]
+        w_trans = w[:, trans_idx, 0, 0, 0].transpose(0, 1).contiguous()  # (St, B)
+        U_t, _Z_t = accumulate_uz_scalar(x.contiguous(), w_trans, trans_shifts)
         U = U + U_t
-        Z = Z + Z_t
 
     for (orig_idx, g) in other_meta:
-        w_g = self._mix_heads(alpha[:, orig_idx], C, head_mix_mat)     # (B, C, 1, 1)
-        U = U + w_g * g.apply(x)
-        Z = Z + w_g
+        U = U + w[:, orig_idx] * g.apply(x)                        # (B,1,1,1)*(B,C,H,W)
 
-    U = U / Z.clamp_min(1e-6)
-    if not return_D:
-        return U, None
-    Z = Z.expand(B, C, H, W)
-    return U, Z
+    if return_D:
+        # W is exactly stochastic (sum_g w_g = 1), so the degree map is one.
+        return U, torch.ones_like(x)
+    return U, None
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +249,9 @@ def _forward_cuda(
 def install_cuda_shift(model_cls):
     """Monkey-patch a GASDDRUNetAttn class to use neural_shift_cuda. Idempotent.
 
-    The patch calls the AttentionWeightHead, spatial pooling and head mixing
-    through the model's own stable API, so internal changes to those stay in
-    sync.
+    The patch calls the AttentionWeightHead, head mixing, scalar pooling and
+    weight finalization through the model's own stable API, so internal changes
+    to those stay in sync.
     """
     if getattr(model_cls, "_cuda_shift_installed", False):
         return model_cls
@@ -281,6 +262,16 @@ def install_cuda_shift(model_cls):
     if torch.cuda.is_available():
         from neural_shift_cuda.ops import _require_cuda_ext
         _require_cuda_ext("install_cuda_shift[gasd]", need_scalar=True)
+
+    # The one-weight-per-transform patch requires the refactored model API.
+    for attr in ("_pool_to_scalar", "_mix_heads", "_head_mix_mat",
+                 "_finalize_weights"):
+        if not hasattr(model_cls, attr):
+            raise AttributeError(
+                f"install_cuda_shift[gasd]: {model_cls.__name__} has no "
+                f"`{attr}` -- this patch targets the one-weight-per-transform "
+                f"GASD refactor. For the older per-channel architecture use a "
+                f"pre-0.6 neural_shift_cuda.")
 
     original_forward = model_cls.forward
 
