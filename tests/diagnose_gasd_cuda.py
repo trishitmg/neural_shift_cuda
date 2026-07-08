@@ -1,7 +1,7 @@
 # Diagnose why the GASD CUDA path is slower than the reference forward.
 # Run on the training machine (needs a GPU):
 #
-#   python tests/diagnose_gasd_cuda.py --model-file GASD_drunet_attn_v2.py
+#   python tests/diagnose_gasd_cuda.py --model-file GASD_drunet_attn.py
 #
 # Checks, in order:
 #   [1] which _C binary is imported and whether the 0.4.x scalar symbols exist
@@ -87,7 +87,7 @@ def count_syncs(model, x, sig):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-file", default="GASD_drunet_attn_v2.py")
+    ap.add_argument("--model-file", default="GASD_drunet_attn.py")
     ap.add_argument("--patch-file", default=None,
                     help="path to gasd_drunet_attn_patch.py; default: installed package")
     ap.add_argument("--B", type=int, default=8)
