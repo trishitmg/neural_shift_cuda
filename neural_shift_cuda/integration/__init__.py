@@ -13,11 +13,21 @@ NeKDe (half-plane, per-pixel weights, comp_box / inverse-symmetry):
     from NKD_drunet_attn_v5 import NeKDeDRUNetAttn
     install_cuda_shift_attn_v5(NeKDeDRUNetAttn)
 
-GASD (fully circular, per-channel group averaging + D4):
+GADSD (fully circular, per-channel group averaging + D4, doubly-stochastic):
+
+    from neural_shift_cuda.integration import install_cuda_shift_gadsd
+    from GADSD_drunet_attn import GADSDDRUNetAttn
+    install_cuda_shift_gadsd(GADSDDRUNetAttn)
+
+GASD (full (2R+1)^2 window, per-pixel weights, row-stochastic Z^{-1}U):
 
     from neural_shift_cuda.integration import install_cuda_shift_gasd
-    from GASD_drunet_attn import GASDDRUNetAttn
+    from GASD_drunet_attn_v2 import GASDDRUNetAttn          # v2 (comp_box)
     install_cuda_shift_gasd(GASDDRUNetAttn)
+
+    from neural_shift_cuda.integration import install_cuda_shift_gasd_v5
+    from GASD_drunet_attn_v5 import GASDDRUNetAttn          # v5 (fully circular)
+    install_cuda_shift_gasd_v5(GASDDRUNetAttn)
 
 Classic nekre model:
 
@@ -30,8 +40,12 @@ Classic nekre model:
 from .nekde_drunet_attn_patch import install_cuda_shift as install_cuda_shift_attn
 from .nekde_drunet_attn_v5_patch import install_cuda_shift as install_cuda_shift_attn_v5
 
-# GASD (per-channel accumulate_uz_scalar path)
+# GADSD (per-channel accumulate_uz_scalar path, doubly-stochastic)
+from .gadsd_drunet_attn_patch import install_cuda_shift as install_cuda_shift_gadsd
+
+# GASD (per-pixel accumulate_uz path, row-stochastic; full (2R+1)^2 window)
 from .gasd_drunet_attn_patch import install_cuda_shift as install_cuda_shift_gasd
+from .gasd_drunet_attn_v5_patch import install_cuda_shift as install_cuda_shift_gasd_v5
 
 # Other model families
 from .nekre_patch import install_cuda_shift as install_cuda_shift_nekre
@@ -41,7 +55,9 @@ from .nkd_metropolis_attn_v5_patch import install_cuda_shift as install_cuda_shi
 __all__ = [
     "install_cuda_shift_attn",
     "install_cuda_shift_attn_v5",
+    "install_cuda_shift_gadsd",
     "install_cuda_shift_gasd",
+    "install_cuda_shift_gasd_v5",
     "install_cuda_shift_nekre",
     "install_cuda_shift_metropolis",
     "install_cuda_shift_metropolis_v5",

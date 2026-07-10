@@ -1,76 +1,60 @@
 """
-Integration patch for GASDDRUNetAttn (GASD_drunet_attn) to use
+Integration patch for GASDDRUNetAttn v2 (GASD_drunet_attn_v2) to use
 neural_shift_cuda kernels.
 
-Architecture
+What this is
 ------------
-GASD is a fully-circular, group-averaged stochastic denoiser::
+A drop-in replacement for the `forward` method of v2's `GASDDRUNetAttn`.
+Same math, same gradients, but:
+  * the F.pad + Python list-comprehension shift gather inside
+    `_all_shift_weights` is replaced by `shift_gather` (one CUDA kernel
+    per chunk, no padded_phi materialization),
+  * the per-shift U/Z accumulation loop in `forward` (including the per-shift
+    `comp_box` masking) is replaced by a single `accumulate_uz` kernel call.
 
-    W x = sum_{g in G} alpha_g P_g x ,   alpha_g > 0, sum_g alpha_g = 1
+GASD vs NeKDe (why this is a separate patch)
+--------------------------------------------
+GASD is the ROW-stochastic (singly-stochastic) denoiser  W = Z^{-1}U:
+  * `_collect_shifts()` returns ALL (2R+1)^2 shifts as (dx, dy) pairs (no
+    half-plane, no `has_inverse` flag), and the weight of every shift is
+    produced independently by the network;
+  * `forward` accumulates each shift exactly ONCE -- there is no circular-shift
+    inverse twin, so U is non-symmetric and K = Z^{-1}U is only row-stochastic.
+The NeKDe patch, by contrast, feeds a half-plane shift list with `has_inverse=1`
+and lets `accumulate_uz` synthesise the symmetric twin. Here we instead build
+the (S, 3) shift tensor with the inverse flag set to 0 on EVERY row, so
+`accumulate_uz` performs the forward circular gather only -- the exact
+full-window, non-symmetric operator GASD's reference forward computes.
 
-where alpha_g is a PER-CHANNEL scalar per transform: the head emits a
-per-pixel, per-head map; ``_mix_heads`` combines heads into C channels (still
-per-pixel); ``_pool_spatial`` pools over (H, W) ONLY, keeping the channel axis,
-so each transform g yields an (B, C) vector of weights -- C*S weights per
-image. ``_finalize_weights`` normalizes over the transform axis PER CHANNEL
-(sum_g alpha_g = 1 for each channel), so W is exactly stochastic and the degree
-map Z is identically one (no U/Z division).
+Difference from the v5 patch
+----------------------------
+v2 multiplies every shift's weight by `comp_box` (zeros out the boundary region
+that circular padding wrapped in), so it is a TRUNCATED (non-periodic) NLM. The
+CUDA analog is the `w_all = w_all * mask_all` step below, `mask_all` being
+shift_gather's wrap indicator. Because every shift's inverse flag is 0, only the
+forward mask is applied (there is no inverse-branch comp_box), which matches v2's
+forward exactly. v5 DROPS this masking step (it is fully periodic).
 
-This is a drop-in replacement for ``forward``. Same math, same gradients, but:
-
-  * the per-transform feature gather ``torch.cat([g.apply(phi) for g ...])``
-    inside ``_transform_weights`` is replaced, for the TRANSLATION transforms,
-    by a single ``shift_gather`` CUDA kernel per chunk (no per-shift
-    ``torch.roll`` and no ``torch.cat``);
-  * the per-channel weighted accumulation loop ``U += alpha_g * P_g x`` in
-    ``forward`` is replaced, for the TRANSLATION transforms, by a single fused
-    ``accumulate_uz_scalar`` call with (St, B, C) weights -- one scalar per
-    (transform, image, channel), never materialized per-pixel. The kernel's Z
-    output is discarded (weights are pre-normalized, so there is no division).
-
-D4 transforms (``rot90``/``flip``/``transpose`` ...) are index permutations, not
-translations, so they are handled with the model's own ``g.apply`` in a small
-torch pass (at most 8 of them). Transform ordering is preserved so
-``w[:, idx]`` still lines up with ``self.transforms[idx]``.
-
-Model-owned pieces
-------------------
-Head calls (``attn_head.logit`` / ``attn_head.weight``), head mixing
-(``self._mix_heads`` with ``self._head_mix_mat()``), spatial pooling
-(``self._pool_spatial``), the control-sigmoid clamp and the transform-axis
-normalization (``self._finalize_weights``) are all invoked on the model itself,
-so any change to those stays in sync automatically. The per-chunk pipeline
-mirrors ``_transform_weights`` exactly: head -> _mix_heads (per-pixel) ->
-_pool_spatial; head-mix BEFORE pooling matters for n_heads > 1 and for
-'sum'/'max' pooling, where the two orders do not commute.
-
-max_batch_shifts / gradient checkpointing
------------------------------------------
-Both are honoured HERE, exactly as the reference ``_transform_weights`` does:
-  * ``self.max_batch_shifts`` chunks the head evaluation (translations AND D4)
-    so peak activation memory is bounded by the chunk, not by S.
-  * ``self.use_grad_checkpoint`` wraps each per-chunk head call in
-    ``torch.utils.checkpoint`` (``use_reentrant=False``); mixing and pooling
-    stay outside the checkpoint, as in the reference.
-
-Shift convention
+What this is NOT
 ----------------
-``shift_gather`` / ``accumulate_uz_scalar`` use GATHER indexing
-``out[h,w] = in[(h+dx)%H, (w+dy)%W]``, whereas ``ShiftTransform(dx, dy).apply``
-uses ``torch.roll(t, (dx, dy))`` = ``in[(h-dx)%H, (w-dy)%W]``. To reproduce the
-model's transform EXACTLY (per index, so equivalence is tight, not just
-set-equal), we pass ``(-dx, -dy)`` to the kernels for a ``ShiftTransform(dx,
-dy)``. The same negated shift is used for both the phi gather and the x
-accumulate, so each transform index maps to the same permutation on both sides.
+This does not touch the AttentionWeightHead. Its `logit` / `weight` methods
+take phi_c and phi_s as SEPARATE tensors (q_proj acts on phi_c, k_proj on
+phi_s), so `pair_gather` (channel-concat fusion) is not applicable here.
+
+Head mixing
+-----------
+GASD keeps the `head_mix_pos_act` knob ('softmax' | 'softplus' | 'relu'), so the
+patch builds `head_mix_mat` with the SAME activation the model would use,
+rather than hardcoding softmax.
 
 Usage
 -----
-    from GASD_drunet_attn import GASDDRUNetAttn
+    from GASD_drunet_attn_v2 import GASDDRUNetAttn
     from gasd_drunet_attn_patch import install_cuda_shift
     install_cuda_shift(GASDDRUNetAttn)
 
-After this, every instance routes its forward through the CUDA path when the
-input is on a CUDA device. To disable per-instance:
+After this, every GASDDRUNetAttn instance routes its forward through the CUDA
+path when the input is on a CUDA device. To disable per-instance:
 
     model.use_cuda_shift = False
 """
@@ -78,55 +62,76 @@ input is on a CUDA device. To disable per-instance:
 from __future__ import annotations
 
 import inspect
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from neural_shift_cuda import shift_gather, accumulate_uz_scalar
+from neural_shift_cuda import shift_gather, accumulate_uz
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _run_head(head_fn, phi_c, phi_s, sig, use_ckpt):
-    """Call the attention head, optionally under gradient checkpointing."""
-    if use_ckpt:
-        return grad_checkpoint(head_fn, phi_c, phi_s, sig, use_reentrant=False)
-    return head_fn(phi_c, phi_s, sig)
+def _get_shift_tensor(self, device: torch.device) -> torch.Tensor:
+    """Cache the (S, 3) int32 shift tensor on `device`.
+
+    GASD's `_collect_shifts()` returns (dx, dy) pairs over the FULL (2R+1)^2
+    window. We build the (S, 3) tensor with the inverse flag pinned to 0 on
+    every row, so `accumulate_uz` does the forward circular gather only (no
+    symmetric twin) -- the non-symmetric, row-stochastic operator GASD wants.
+    """
+    if (getattr(self, "_cached_shift_tensor", None) is None
+            or self._cached_shift_device != device):
+        shifts = self._collect_shifts()              # [(dx, dy), ...] full window
+        rows = [(int(dx), int(dy), 0) for (dx, dy) in shifts]
+        self._cached_shift_tensor = torch.tensor(
+            rows, dtype=torch.int32, device=device)
+        self._cached_shift_device = device
+    return self._cached_shift_tensor
 
 
-def _gasd_transform_partition(self):
-    """Split self.transforms into translation entries and 'other' (D4) entries,
-    preserving original indices. Cached; invalidated if the list identity
-    changes (it is built once in __init__)."""
-    cache = getattr(self, "_gasd_part_cache", None)
-    if cache is not None and cache[0] == id(self.transforms):
-        return cache[1], cache[2]
-    trans_meta: List[Tuple[int, int, int]] = []   # (orig_idx, dx, dy)
-    other_meta: List[Tuple[int, object]] = []      # (orig_idx, transform_obj)
-    for i, g in enumerate(self.transforms):
-        if hasattr(g, "dx") and hasattr(g, "dy"):
-            trans_meta.append((i, int(g.dx), int(g.dy)))
-        else:
-            other_meta.append((i, g))
-    self._gasd_part_cache = (id(self.transforms), trans_meta, other_meta)
-    return trans_meta, other_meta
+def _head_mix_mat(self) -> Optional[torch.Tensor]:
+    """Build the (C, n_heads) head-mixing matrix using the model's own
+    `head_mix_pos_act`. Matches GASDDRUNetAttn.forward exactly; defaults to
+    'softmax' for instances that lack the attribute."""
+    if self.raw_head_mix is None:
+        return None
+    act = getattr(self, "head_mix_pos_act", "softmax")
+    if act == "softmax":
+        return F.softmax(self.raw_head_mix, dim=1)
+    if act == "softplus":
+        return F.softplus(self.raw_head_mix)
+    return F.relu(self.raw_head_mix)
 
 
-def _gasd_trans_shifts(self, trans_meta, device: torch.device) -> torch.Tensor:
-    """Cache the (St, 2) int32 NEGATED shift tensor (gather convention) on
-    ``device`` -- see the 'Shift convention' note in the module docstring."""
-    cache = getattr(self, "_gasd_shift_cache", None)
-    if (cache is not None and cache[0] == id(self.transforms)
-            and cache[1] == device):
-        return cache[2]
-    rows = [(-dx, -dy) for (_, dx, dy) in trans_meta]
-    shifts = (torch.tensor(rows, dtype=torch.int32, device=device)
-              if rows else torch.empty(0, 2, dtype=torch.int32, device=device))
-    self._gasd_shift_cache = (id(self.transforms), device, shifts)
-    return shifts
+def _mix_heads_vec(
+    w_stack: torch.Tensor,            # (S, B, n_heads, H, W)
+    C: int,
+    head_mix_mat: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Vectorised _mix_heads over the full stack. Output: (S, B, C, H, W).
+
+    Mirrors GASDDRUNetAttn._mix_heads case-for-case:
+      * n_heads == 1            -> broadcast to C channels
+      * head_mix_mat available  -> (C, n_heads) @ stack
+      * n_heads == C            -> identity
+      * fallback                -> mean across heads, broadcast to C
+    The result is bit-identical to looping the per-shift version, just
+    fused across the S axis to save S kernel launches.
+    """
+    n_heads = w_stack.size(2)
+    if n_heads == 1:
+        return w_stack.expand(-1, -1, C, -1, -1)
+    if head_mix_mat is not None:
+        # (C, h) x (S, B, h, H, W) -> (S, B, C, H, W)
+        return torch.einsum("ch,sbhij->sbcij", head_mix_mat, w_stack).contiguous()
+    if n_heads == C:
+        return w_stack
+    return w_stack.mean(dim=2, keepdim=True).expand(-1, -1, C, -1, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -138,22 +143,22 @@ def _forward_cuda(
     x: torch.Tensor,
     guide: Optional[torch.Tensor] = None,
     sig: Optional[torch.Tensor] = None,
-    return_D: bool = False,
+    return_D: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """CUDA-accelerated drop-in for ``GASDDRUNetAttn.forward``
-    (per-channel, C*S-weights-per-image architecture).
+    """CUDA-accelerated drop-in replacement for v2 GASDDRUNetAttn.forward.
 
-    Numerics: identical to the reference forward up to floating-point reduction
-    order (~1e-5 fp32, exact fp64).
+    Numerics: identical to the v2 reference forward up to floating-point
+    reduction order (~1e-5 in fp32, exact in fp64). comp_box boundary masking
+    is applied via shift_gather's wrap indicator, matching v2's truncated NLM.
     """
+    if not self.training:
+        # OOM-avoidance at test time. Mirrors the NeKDe patches.
+        self.max_batch_shifts = 10
+
     B, C, H, W = x.shape
+    R = self.window_rad
 
-    if getattr(self, "_requires_square", False) and H != W:
-        raise ValueError(
-            f"transform_family={getattr(self, 'transform_family', '?')!r} uses "
-            f"D4 transforms, which require a square image, got H={H}, W={W}.")
-
-    # ---- Normalise sigma to (B, 1, 1, 1) (verbatim from the model) ----
+    # ---- Normalise sigma to (B, 1, 1, 1) (verbatim from original) ----
     if sig is not None and not torch.is_tensor(sig):
         sig = x.new_full((B, 1, 1, 1), float(sig))
     elif sig is not None:
@@ -164,86 +169,100 @@ def _forward_cuda(
 
     # ---- Guide features ----
     g_input = x if guide is None else guide
-    phi = self.pre_activation(g_input, sigma=sig).contiguous()      # (B, F, H, W)
+    phi = self.pre_activation(g_input, sigma=sig).contiguous()   # (B, F, H, W)
 
-    trans_meta, other_meta = _gasd_transform_partition(self)
-    S = len(self.transforms)
-    chunk = self.max_batch_shifts if self.max_batch_shifts is not None else max(S, 1)
+    # ---- Shift tensor (full window, inverse flag = 0 on every row) ----
+    shifts_t = self._get_shift_tensor(x.device)                  # (S, 3) int32
+    shifts_xy = shifts_t[:, :2].contiguous()                     # (S, 2)
+    S = shifts_t.shape[0]
+    chunk = self.max_batch_shifts if self.max_batch_shifts is not None else S
 
-    head_fn = (self.attn_head.logit
-               if self.output_activation == "softmax"
-               else self.attn_head.weight)
-    head_mix_mat = self._head_mix_mat()
+    # ---- Head-mixing matrix (respects head_mix_pos_act) ----
+    head_mix_mat = _head_mix_mat(self)
 
-    # Per-channel weight tile (B, C, 1, 1) per transform, placed by orig index.
-    # Per-chunk pipeline mirrors _transform_weights: head -> _mix_heads
-    # (per-pixel, heads -> C channels) -> _pool_spatial over (H, W).
-    chan_tiles: List[Optional[torch.Tensor]] = [None] * S
+    # ------------------------------------------------------------------
+    # Per-chunk weight computation.
+    #
+    # For each chunk:
+    #   1. shift_gather(phi, shifts_chunk) -> (n*B, F, H, W) gathered phi_s,
+    #      plus (n*B, 1, H, W) validity mask (the comp_box wrap indicator).
+    #   2. phi_c_batch = phi.repeat(n, 1, 1, 1) (unchanged).
+    #   3. attn_head.logit / weight as before.
+    # The mask tiles are concatenated outside the loop -- we need the
+    # full (S*B, 1, H, W) mask to fold comp_box into the weights.
+    # ------------------------------------------------------------------
+    weight_tiles: List[torch.Tensor] = []   # logits or weights depending on path
+    mask_tiles: List[torch.Tensor] = []
 
-    # ---- (a) translation transforms: shift_gather + chunked head ----
-    trans_shifts = _gasd_trans_shifts(self, trans_meta, x.device)   # (St, 2) int32
-    St = trans_shifts.size(0)
-    for start in range(0, St, chunk):
-        end = min(start + chunk, St)
+    for start in range(0, S, chunk):
+        end = min(start + chunk, S)
         n = end - start
-        shifts_chunk = trans_shifts[start:end].contiguous()
-        phi_s_batch, _ = shift_gather(phi, shifts_chunk)            # (n*B, F, H, W)
+        shifts_chunk = shifts_xy[start:end]                      # (n, 2) int32
+
+        phi_s_batch, mask_chunk = shift_gather(
+            phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
         phi_c_batch = phi.repeat(n, 1, 1, 1)
         sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
 
-        m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
-                      self.use_grad_checkpoint)                     # (n*B, h, H, W)
-        m = self._mix_heads(m, C, head_mix_mat)                    # (n*B, C, H, W)
-        m = self._pool_spatial(m)                                  # (n*B, C, 1, 1)
-        for j, tile in enumerate(m.split(B, dim=0)):
-            chan_tiles[trans_meta[start + j][0]] = tile
+        if self.output_activation == "softmax":
+            if self.use_grad_checkpoint:
+                t = grad_checkpoint(
+                    self.attn_head.logit, phi_c_batch, phi_s_batch, sig_batch,
+                    use_reentrant=False,
+                )
+            else:
+                t = self.attn_head.logit(phi_c_batch, phi_s_batch, sig_batch)
+        else:  # control_sigmoid
+            if self.use_grad_checkpoint:
+                t = grad_checkpoint(
+                    self.attn_head.weight, phi_c_batch, phi_s_batch, sig_batch,
+                    use_reentrant=False,
+                )
+            else:
+                t = self.attn_head.weight(phi_c_batch, phi_s_batch, sig_batch)
 
-    # ---- (b) D4 / other transforms: torch permutation + chunked head ----
-    for start in range(0, len(other_meta), chunk):
-        grp = other_meta[start:start + chunk]
-        n = len(grp)
-        phi_s_batch = torch.cat([g.apply(phi) for (_, g) in grp], dim=0)
-        phi_c_batch = phi.repeat(n, 1, 1, 1)
-        sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
+        # t: (n*B, n_heads, H, W). Split into n per-shift (B, n_heads, H, W) tiles.
+        weight_tiles.extend(t.split(B, dim=0))
+        mask_tiles.append(mask_chunk)        # (n*B, 1, H, W)
 
-        m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
-                      self.use_grad_checkpoint)
-        m = self._mix_heads(m, C, head_mix_mat)
-        m = self._pool_spatial(m)
-        for j, tile in enumerate(m.split(B, dim=0)):
-            chan_tiles[grp[j][0]] = tile
+    # ---- Joint softmax across ALL (2R+1)^2 shifts (softmax path only) ----
+    # NOTE: matching v2's reference forward, comp_box is applied AFTER the
+    # softmax (masked weights need not re-normalize to sum 1 at the border);
+    # Z below is the sum of the masked weights, so W = Z^{-1}U stays row-
+    # stochastic wherever Z > 0.
+    if self.output_activation == "softmax":
+        # Stack: (B, S, n_heads, H, W)
+        logits = torch.stack(weight_tiles, dim=1)
+        logits = logits - logits.amax(dim=1, keepdim=True)
+        w_per_shift = F.softmax(logits, dim=1)                   # (B, S, n_heads, H, W)
+    else:
+        # Already positive; just stack.
+        w_per_shift = torch.stack(weight_tiles, dim=1)           # (B, S, n_heads, H, W)
 
-    aff = torch.stack(chan_tiles, dim=1)                           # (B, S, C, 1, 1)
+    # Reorder to shift-major to match shift_gather/accumulate_uz convention.
+    # (B, S, h, H, W) -> (S, B, h, H, W)
+    w_stack = w_per_shift.permute(1, 0, 2, 3, 4).contiguous()
 
-    # Raw scores exactly as _transform_weights returns them: raw logits for
-    # 'softmax', clamped positive affinities for 'control_sigmoid'; then the
-    # model's own per-channel transform-axis normalization (sum_g w_g = 1).
-    raw = aff if self.output_activation == "softmax" else aff.clamp_min(1e-8)
-    w = self._finalize_weights(raw)                                # (B, S, C, 1, 1)
+    # Head-mix to per-channel weights: (S, B, h, H, W) -> (S, B, C, H, W)
+    w_stack = _mix_heads_vec(w_stack, C, head_mix_mat)
 
-    # ------------------------------------------------------------------
-    # Group-averaged accumulation: U = sum_g w_g P_g x, sum_g w_g = 1 (per
-    # channel).
-    #   translations -> fused accumulate_uz_scalar with (St, B, C) weights
-    #                   (one scalar per transform per channel); the kernel's Z
-    #                   output is discarded -- no division.
-    #   D4 / other    -> torch per-channel weighted permutation accumulate.
-    # ------------------------------------------------------------------
-    U = torch.zeros_like(x)
+    # Flatten to (S*B, C, H, W) and apply the forward comp_box mask.
+    w_all = w_stack.view(S * B, C, H, W)
+    mask_all = torch.cat(mask_tiles, dim=0)                      # (S*B, 1, H, W)
+    w_all = (w_all * mask_all).contiguous()
 
-    if St > 0:
-        trans_idx = [orig_idx for (orig_idx, _dx, _dy) in trans_meta]
-        # w[:, trans_idx] is (B, St, C, 1, 1) -> (St, B, C)
-        w_trans = w[:, trans_idx, :, 0, 0].permute(1, 0, 2).contiguous()
-        U_t, _Z_t = accumulate_uz_scalar(x.contiguous(), w_trans, trans_shifts)
-        U = U + U_t
+    # ---- Single fused U/Z accumulation (forward only; inverse flag = 0) ----
+    # Every row of shifts_t has has_inverse=0, so accumulate_uz gathers x
+    # circularly and places each (comp_box-masked) weight at K[i, i+d] ONLY --
+    # the full-window, non-symmetric operator v2's forward computes.
+    U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
+    U = U_num / Z.clamp_min(1e-6)
 
-    for (orig_idx, g) in other_meta:
-        U = U + w[:, orig_idx] * g.apply(x)                        # (B,C,1,1)*(B,C,H,W)
+    if not self.training:
+        self.max_batch_shifts = None
 
     if return_D:
-        # W is exactly stochastic (sum_g w_g = 1 per channel), so Z is one.
-        return U, torch.ones_like(x)
+        return U, Z
     return U, None
 
 
@@ -252,32 +271,15 @@ def _forward_cuda(
 # ---------------------------------------------------------------------------
 
 def install_cuda_shift(model_cls):
-    """Monkey-patch a GASDDRUNetAttn class to use neural_shift_cuda. Idempotent.
+    """Monkey-patch a v2 GASDDRUNetAttn class to use neural_shift_cuda.
 
-    The patch calls the AttentionWeightHead, head mixing, spatial pooling and
-    weight finalization through the model's own stable API, so internal changes
-    to those stay in sync.
+    Idempotent. The patch calls the AttentionWeightHead only through its stable
+    public API (`logit` / `weight`), so head-internal changes do not affect it.
     """
     if getattr(model_cls, "_cuda_shift_installed", False):
         return model_cls
 
-    # Fail at install time, not mid-training: if the compiled binary is stale
-    # (missing the scalar symbols) or failed to import, the ops layer would
-    # otherwise only raise on the first CUDA forward.
-    if torch.cuda.is_available():
-        from neural_shift_cuda.ops import _require_cuda_ext
-        _require_cuda_ext("install_cuda_shift[gasd]", need_scalar=True)
-
-    # This patch targets the per-channel (C*S weights per image) GASD.
-    for attr in ("_pool_spatial", "_mix_heads", "_head_mix_mat",
-                 "_finalize_weights"):
-        if not hasattr(model_cls, attr):
-            raise AttributeError(
-                f"install_cuda_shift[gasd]: {model_cls.__name__} has no "
-                f"`{attr}` -- this patch targets the per-channel GASD "
-                f"architecture (C*S weights per image, pooled over (H, W) with "
-                f"`_pool_spatial`).")
-
+    model_cls._get_shift_tensor = _get_shift_tensor
     original_forward = model_cls.forward
 
     # Derive return_D's default from the wrapped forward so the patched
@@ -286,12 +288,16 @@ def install_cuda_shift(model_cls):
     _fwd_sig = inspect.signature(original_forward)
     _has_return_D = "return_D" in _fwd_sig.parameters
     _return_D_default = (
-        _fwd_sig.parameters["return_D"].default if _has_return_D else False)
+        _fwd_sig.parameters["return_D"].default if _has_return_D else True)
 
     def patched_forward(self, x, guide=None, sig=None,
                         return_D=_return_D_default):
-        if not hasattr(self, "use_cuda_shift"):
+        # Lazy-init cache fields so we don't need to touch __init__.
+        if not hasattr(self, "_cached_shift_tensor"):
             self.use_cuda_shift = True
+            self._cached_shift_tensor = None
+            self._cached_shift_device = None
+
         if getattr(self, "use_cuda_shift", True) and x.is_cuda:
             return _forward_cuda(self, x, guide=guide, sig=sig,
                                  return_D=return_D)

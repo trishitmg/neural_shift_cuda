@@ -1,7 +1,7 @@
-# Diagnose why the GASD CUDA path is slower than the reference forward.
+# Diagnose why the GADSD CUDA path is slower than the reference forward.
 # Run on the training machine (needs a GPU):
 #
-#   python tests/diagnose_gasd_cuda.py --model-file GASD_drunet_attn.py
+#   python tests/diagnose_gadsd_cuda.py --model-file GADSD_drunet_attn.py
 #
 # Checks, in order:
 #   [1] which _C binary is imported and whether the 0.4.x scalar symbols exist
@@ -20,10 +20,10 @@ import torch
 
 
 def load_model_class(path):
-    spec = importlib.util.spec_from_file_location("gasd_model", path)
+    spec = importlib.util.spec_from_file_location("gadsd_model", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.GASDDRUNetAttn
+    return mod.GADSDDRUNetAttn
 
 
 def check_extension():
@@ -87,17 +87,17 @@ def count_syncs(model, x, sig):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-file", default="GASD_drunet_attn.py")
+    ap.add_argument("--model-file", default="GADSD_drunet_attn.py")
     ap.add_argument("--patch-file", default=None,
-                    help="path to gasd_drunet_attn_patch.py; default: installed package")
+                    help="path to gadsd_drunet_attn_patch.py; default: installed package")
     ap.add_argument("--B", type=int, default=8)
     ap.add_argument("--H", type=int, default=96)
     args = ap.parse_args()
 
     ok = check_extension()
 
-    GASD = load_model_class(args.model_file)
-    model = GASD(
+    GADSD = load_model_class(args.model_file)
+    model = GADSD(
         in_channels=3, window_rad=5, feat_ch=128,
         drunet_nc=[64, 128, 256], drunet_nb=2, noise_map=True,
         qk_ch=32, n_heads=4, init_tau=1.0, activation="ReLU",
@@ -108,13 +108,13 @@ def main():
     ).cuda().train()
 
     if args.patch_file:
-        spec = importlib.util.spec_from_file_location("gasd_patch", args.patch_file)
+        spec = importlib.util.spec_from_file_location("gadsd_patch", args.patch_file)
         patch = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(patch)
         patch.install_cuda_shift(type(model))
     else:
-        from neural_shift_cuda.integration import install_cuda_shift_gasd
-        install_cuda_shift_gasd(type(model))
+        from neural_shift_cuda.integration import install_cuda_shift_gadsd
+        install_cuda_shift_gadsd(type(model))
 
     x = torch.randn(args.B, 3, args.H, args.H, device="cuda", requires_grad=True)
     sig = torch.full((args.B, 1, 1, 1), 25 / 255, device="cuda")

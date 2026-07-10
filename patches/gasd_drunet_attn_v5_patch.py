@@ -1,16 +1,16 @@
 """
-Integration patch for GASDDRUNetAttn v2 (GASD_drunet_attn_v2) to use
+Integration patch for GASDDRUNetAttn v5 (GASD_drunet_attn_v5) to use
 neural_shift_cuda kernels.
 
 What this is
 ------------
-A drop-in replacement for the `forward` method of v2's `GASDDRUNetAttn`.
+A drop-in replacement for the `forward` method of v5's `GASDDRUNetAttn`.
 Same math, same gradients, but:
   * the F.pad + Python list-comprehension shift gather inside
     `_all_shift_weights` is replaced by `shift_gather` (one CUDA kernel
     per chunk, no padded_phi materialization),
-  * the per-shift U/Z accumulation loop in `forward` (including the per-shift
-    `comp_box` masking) is replaced by a single `accumulate_uz` kernel call.
+  * the per-shift U/Z accumulation loop in `forward` is replaced by a single
+    `accumulate_uz` kernel call.
 
 GASD vs NeKDe (why this is a separate patch)
 --------------------------------------------
@@ -26,14 +26,16 @@ the (S, 3) shift tensor with the inverse flag set to 0 on EVERY row, so
 `accumulate_uz` performs the forward circular gather only -- the exact
 full-window, non-symmetric operator GASD's reference forward computes.
 
-Difference from the v5 patch
+Difference from the v2 patch
 ----------------------------
-v2 multiplies every shift's weight by `comp_box` (zeros out the boundary region
-that circular padding wrapped in), so it is a TRUNCATED (non-periodic) NLM. The
-CUDA analog is the `w_all = w_all * mask_all` step below, `mask_all` being
-shift_gather's wrap indicator. Because every shift's inverse flag is 0, only the
-forward mask is applied (there is no inverse-branch comp_box), which matches v2's
-forward exactly. v5 DROPS this masking step (it is fully periodic).
+v5 is fully periodic (circulant): every pixel aggregates all (2R+1)^2 neighbours
+via circular wraparound, with NO boundary masking. v5 therefore DROPS the
+`comp_box` masking the v2 patch applies (`w_all = w_all * mask_all`):
+  * shift_gather already gathers phi circularly, so the boundary logits match
+    v5's circular padded_phi -- its wrap-mask output is simply ignored here;
+  * accumulate_uz natively performs the circular forward gather, which IS the
+    periodic operator v5 wants.
+Everything else is identical to the v2 patch.
 
 What this is NOT
 ----------------
@@ -49,8 +51,8 @@ rather than hardcoding softmax.
 
 Usage
 -----
-    from GASD_drunet_attn_v2 import GASDDRUNetAttn
-    from gasd_drunet_attn_patch import install_cuda_shift
+    from GASD_drunet_attn_v5 import GASDDRUNetAttn
+    from gasd_drunet_attn_v5_patch import install_cuda_shift
     install_cuda_shift(GASDDRUNetAttn)
 
 After this, every GASDDRUNetAttn instance routes its forward through the CUDA
@@ -143,13 +145,13 @@ def _forward_cuda(
     x: torch.Tensor,
     guide: Optional[torch.Tensor] = None,
     sig: Optional[torch.Tensor] = None,
-    return_D: bool = True,
+    return_D: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """CUDA-accelerated drop-in replacement for v2 GASDDRUNetAttn.forward.
+    """CUDA-accelerated drop-in replacement for v5 GASDDRUNetAttn.forward.
 
-    Numerics: identical to the v2 reference forward up to floating-point
-    reduction order (~1e-5 in fp32, exact in fp64). comp_box boundary masking
-    is applied via shift_gather's wrap indicator, matching v2's truncated NLM.
+    Numerics: identical to the v5 reference forward up to floating-point
+    reduction order (~1e-5 in fp32, exact in fp64). No boundary masking: the
+    operator is periodic (circular), matching v5's comp_box-free forward.
     """
     if not self.training:
         # OOM-avoidance at test time. Mirrors the NeKDe patches.
@@ -184,23 +186,21 @@ def _forward_cuda(
     # Per-chunk weight computation.
     #
     # For each chunk:
-    #   1. shift_gather(phi, shifts_chunk) -> (n*B, F, H, W) gathered phi_s,
-    #      plus (n*B, 1, H, W) validity mask (the comp_box wrap indicator).
+    #   1. shift_gather(phi, shifts_chunk) -> (n*B, F, H, W) gathered phi_s.
+    #      The gather is circular, so the boundary features match v5's
+    #      circular padded_phi. The returned wrap-mask is ignored here (v5 is
+    #      periodic -- there is no comp_box to apply).
     #   2. phi_c_batch = phi.repeat(n, 1, 1, 1) (unchanged).
     #   3. attn_head.logit / weight as before.
-    # The mask tiles are concatenated outside the loop -- we need the
-    # full (S*B, 1, H, W) mask to fold comp_box into the weights.
     # ------------------------------------------------------------------
     weight_tiles: List[torch.Tensor] = []   # logits or weights depending on path
-    mask_tiles: List[torch.Tensor] = []
 
     for start in range(0, S, chunk):
         end = min(start + chunk, S)
         n = end - start
         shifts_chunk = shifts_xy[start:end]                      # (n, 2) int32
 
-        phi_s_batch, mask_chunk = shift_gather(
-            phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
+        phi_s_batch, _ = shift_gather(phi, shifts_chunk)          # (n*B, F, H, W); mask ignored
         phi_c_batch = phi.repeat(n, 1, 1, 1)
         sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
 
@@ -223,13 +223,8 @@ def _forward_cuda(
 
         # t: (n*B, n_heads, H, W). Split into n per-shift (B, n_heads, H, W) tiles.
         weight_tiles.extend(t.split(B, dim=0))
-        mask_tiles.append(mask_chunk)        # (n*B, 1, H, W)
 
     # ---- Joint softmax across ALL (2R+1)^2 shifts (softmax path only) ----
-    # NOTE: matching v2's reference forward, comp_box is applied AFTER the
-    # softmax (masked weights need not re-normalize to sum 1 at the border);
-    # Z below is the sum of the masked weights, so W = Z^{-1}U stays row-
-    # stochastic wherever Z > 0.
     if self.output_activation == "softmax":
         # Stack: (B, S, n_heads, H, W)
         logits = torch.stack(weight_tiles, dim=1)
@@ -246,15 +241,13 @@ def _forward_cuda(
     # Head-mix to per-channel weights: (S, B, h, H, W) -> (S, B, C, H, W)
     w_stack = _mix_heads_vec(w_stack, C, head_mix_mat)
 
-    # Flatten to (S*B, C, H, W) and apply the forward comp_box mask.
-    w_all = w_stack.view(S * B, C, H, W)
-    mask_all = torch.cat(mask_tiles, dim=0)                      # (S*B, 1, H, W)
-    w_all = (w_all * mask_all).contiguous()
+    # Flatten to (S*B, C, H, W). No validity mask -- v5 is periodic.
+    w_all = w_stack.view(S * B, C, H, W).contiguous()
 
     # ---- Single fused U/Z accumulation (forward only; inverse flag = 0) ----
     # Every row of shifts_t has has_inverse=0, so accumulate_uz gathers x
-    # circularly and places each (comp_box-masked) weight at K[i, i+d] ONLY --
-    # the full-window, non-symmetric operator v2's forward computes.
+    # circularly and places each weight at K[i, i+d] ONLY -- the full-window,
+    # non-symmetric, row-stochastic operator GASD's forward computes.
     U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
     U = U_num / Z.clamp_min(1e-6)
 
@@ -271,7 +264,7 @@ def _forward_cuda(
 # ---------------------------------------------------------------------------
 
 def install_cuda_shift(model_cls):
-    """Monkey-patch a v2 GASDDRUNetAttn class to use neural_shift_cuda.
+    """Monkey-patch a v5 GASDDRUNetAttn class to use neural_shift_cuda.
 
     Idempotent. The patch calls the AttentionWeightHead only through its stable
     public API (`logit` / `weight`), so head-internal changes do not affect it.
@@ -288,7 +281,7 @@ def install_cuda_shift(model_cls):
     _fwd_sig = inspect.signature(original_forward)
     _has_return_D = "return_D" in _fwd_sig.parameters
     _return_D_default = (
-        _fwd_sig.parameters["return_D"].default if _has_return_D else True)
+        _fwd_sig.parameters["return_D"].default if _has_return_D else False)
 
     def patched_forward(self, x, guide=None, sig=None,
                         return_D=_return_D_default):
