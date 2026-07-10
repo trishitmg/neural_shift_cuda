@@ -19,6 +19,13 @@ GADSD (fully circular, per-channel group averaging + D4, doubly-stochastic):
     from GADSD_drunet_attn import GADSDDRUNetAttn
     install_cuda_shift_gadsd(GADSDDRUNetAttn)
 
+GADSD lightweight (stack-consuming pairwise-moment head, per-channel scalar
+weights; patches _transform_weights AND forward):
+
+    from neural_shift_cuda.integration import install_cuda_shift_gadsd_lightweight
+    from GADSD_lightweight import GADSDLightweight
+    install_cuda_shift_gadsd_lightweight(GADSDLightweight)
+
 GASD (full (2R+1)^2 window, per-pixel weights, row-stochastic Z^{-1}U):
 
     from neural_shift_cuda.integration import install_cuda_shift_gasd
@@ -42,6 +49,7 @@ from .nekde_drunet_attn_v5_patch import install_cuda_shift as install_cuda_shift
 
 # GADSD (per-channel accumulate_uz_scalar path, doubly-stochastic)
 from .gadsd_drunet_attn_patch import install_cuda_shift as install_cuda_shift_gadsd
+from .gadsd_lightweight_patch import install_cuda_shift as install_cuda_shift_gadsd_lightweight
 
 # GASD (per-pixel accumulate_uz path, row-stochastic; full (2R+1)^2 window)
 from .gasd_drunet_attn_patch import install_cuda_shift as install_cuda_shift_gasd
@@ -56,6 +64,7 @@ __all__ = [
     "install_cuda_shift_attn",
     "install_cuda_shift_attn_v5",
     "install_cuda_shift_gadsd",
+    "install_cuda_shift_gadsd_lightweight",
     "install_cuda_shift_gasd",
     "install_cuda_shift_gasd_v5",
     "install_cuda_shift_nekre",
