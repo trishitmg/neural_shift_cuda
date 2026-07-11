@@ -26,14 +26,17 @@ the (S, 3) shift tensor with the inverse flag set to 0 on EVERY row, so
 `accumulate_uz` performs the forward circular gather only -- the exact
 full-window, non-symmetric operator GASD's reference forward computes.
 
-Difference from the v5 patch
-----------------------------
-v2 multiplies every shift's weight by `comp_box` (zeros out the boundary region
-that circular padding wrapped in), so it is a TRUNCATED (non-periodic) NLM. The
-CUDA analog is the `w_all = w_all * mask_all` step below, `mask_all` being
-shift_gather's wrap indicator. Because every shift's inverse flag is 0, only the
-forward mask is applied (there is no inverse-branch comp_box), which matches v2's
-forward exactly. v5 DROPS this masking step (it is fully periodic).
+comp_box toggle
+---------------
+The model's `comp_box` flag is honoured at runtime (this replaces the former
+separate v5 patch):
+  * comp_box=True  -> truncated (non-periodic) NLM. Every shift's weight is
+    multiplied by `comp_box` (zeros out the boundary region that circular
+    padding wrapped in); the CUDA analog is the `w_all = w_all * mask_all`
+    step below, `mask_all` being shift_gather's wrap indicator. Because every
+    shift's inverse flag is 0, only the forward mask is applied.
+  * comp_box=False -> fully periodic (circulant) NLM; the mask step is skipped.
+Instances without the attribute default to True (the historical behaviour).
 
 What this is NOT
 ----------------
@@ -180,6 +183,13 @@ def _forward_cuda(
     # ---- Head-mixing matrix (respects head_mix_pos_act) ----
     head_mix_mat = _head_mix_mat(self)
 
+    # ---- comp_box toggle (runtime; formerly the separate v5 patch) ----
+    # comp_box=True  -> truncated (non-periodic) NLM: mask out wrap-around
+    #                   neighbours via shift_gather's validity mask (old v2).
+    # comp_box=False -> fully periodic (circulant) NLM: no boundary masking
+    #                   (old v5). Default True for instances without the flag.
+    use_box = bool(getattr(self, "comp_box", True))
+
     # ------------------------------------------------------------------
     # Per-chunk weight computation.
     #
@@ -223,7 +233,8 @@ def _forward_cuda(
 
         # t: (n*B, n_heads, H, W). Split into n per-shift (B, n_heads, H, W) tiles.
         weight_tiles.extend(t.split(B, dim=0))
-        mask_tiles.append(mask_chunk)        # (n*B, 1, H, W)
+        if use_box:
+            mask_tiles.append(mask_chunk)        # (n*B, 1, H, W)
 
     # ---- Joint softmax across ALL (2R+1)^2 shifts (softmax path only) ----
     # NOTE: matching v2's reference forward, comp_box is applied AFTER the
@@ -246,10 +257,13 @@ def _forward_cuda(
     # Head-mix to per-channel weights: (S, B, h, H, W) -> (S, B, C, H, W)
     w_stack = _mix_heads_vec(w_stack, C, head_mix_mat)
 
-    # Flatten to (S*B, C, H, W) and apply the forward comp_box mask.
+    # Flatten to (S*B, C, H, W); apply the forward comp_box mask only when
+    # comp_box is on (periodic mode leaves the wrap-around neighbours in).
     w_all = w_stack.view(S * B, C, H, W)
-    mask_all = torch.cat(mask_tiles, dim=0)                      # (S*B, 1, H, W)
-    w_all = (w_all * mask_all).contiguous()
+    if use_box:
+        mask_all = torch.cat(mask_tiles, dim=0)                  # (S*B, 1, H, W)
+        w_all = w_all * mask_all
+    w_all = w_all.contiguous()
 
     # ---- Single fused U/Z accumulation (forward only; inverse flag = 0) ----
     # Every row of shifts_t has has_inverse=0, so accumulate_uz gathers x

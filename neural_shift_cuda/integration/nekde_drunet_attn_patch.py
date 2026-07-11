@@ -13,6 +13,23 @@ Same math, same gradients, but:
     circular-shift inverse-symmetry branch) is replaced by a single
     `accumulate_uz` kernel call.
 
+comp_box handling
+-----------------
+The model's `comp_box` flag is honoured on the CUDA path (this replaces the
+former separate v5 patch); both values are fused, no reference fallback:
+  * comp_box=True  -> truncated NLM. Forward edge masked by shift_gather's
+    validity mask; inverse edge masked by accumulate_uz's built-in has_inverse
+    boundary check. shifts_t carries has_inverse=1 on the half-plane.
+  * comp_box=False -> fully periodic (circulant) NLM. accumulate_uz's
+    has_inverse branch always masks the inverse edge, so it cannot express the
+    periodic operator directly. Instead we enumerate each half-plane shift AND
+    its explicit inverse (-dx,-dy), both with has_inverse=0, feeding the kernel
+    the pre-shifted inverse weight w_inv = roll(w_fwd,(dx,dy)). The kernel then
+    performs forward-only circular gathers with NO masking, reproducing the
+    periodic symmetric operator bit-for-bit -- reusing the already-validated
+    accumulate_uz (no kernel change). Costs ~2x shift entries at comp_box=False.
+Instances without the attribute default to True (the historical behaviour).
+
 What this is NOT
 ----------------
 This does not touch the AttentionWeightHead. Its `logit` / `weight`
@@ -165,6 +182,21 @@ def _forward_cuda(
     # ---- Head-mixing matrix (respects head_mix_pos_act; defaults to softmax) ----
     head_mix_mat = _head_mix_mat(self)
 
+    # ---- comp_box toggle (runtime; replaces the former separate v5 patch) ----
+    # comp_box=True  -> truncated NLM: forward edge masked by shift_gather's
+    #                   validity mask, inverse edge masked by accumulate_uz's
+    #                   built-in has_inverse boundary check.
+    # comp_box=False -> fully periodic (circulant) NLM. accumulate_uz's
+    #                   has_inverse branch always masks the inverse edge, so we
+    #                   CANNOT use it for the periodic operator. Instead we
+    #                   enumerate each half-plane shift AND its explicit inverse
+    #                   (-dx,-dy), both with has_inverse=0, and hand the kernel
+    #                   the pre-shifted inverse weight w_inv = roll(w_fwd,(dx,dy)).
+    #                   The kernel then does pure circular forward gathers with no
+    #                   masking -- exactly the periodic symmetric operator, using
+    #                   the same validated accumulate_uz (no kernel change).
+    use_box = bool(getattr(self, "comp_box", True))
+
     # ------------------------------------------------------------------
     # Per-chunk weight computation.
     #
@@ -212,7 +244,8 @@ def _forward_cuda(
 
         # t: (n*B, n_heads, H, W). Split into n per-shift (B, n_heads, H, W) tiles.
         weight_tiles.extend(t.split(B, dim=0))
-        mask_tiles.append(mask_chunk)        # (n*B, 1, H, W)
+        if use_box:
+            mask_tiles.append(mask_chunk)        # (n*B, 1, H, W)
 
     # ---- Joint softmax across the half-plane shifts (softmax path only) ----
     if self.output_activation == "softmax":
@@ -233,14 +266,38 @@ def _forward_cuda(
     # Head-mix to per-channel weights: (S, B, h, H, W) -> (S, B, C, H, W)
     w_stack = _mix_heads_vec(w_stack, C, head_mix_mat)
 
-    # Flatten to (S*B, C, H, W) and apply forward validity mask.
-    w_all = w_stack.view(S * B, C, H, W)
-    # (S*B, 1, H, W)
-    mask_all = torch.cat(mask_tiles, dim=0)
-    w_all = (w_all * mask_all).contiguous()
+    if use_box:
+        # ---- comp_box=True: mask forward edge, let accumulate_uz mask the
+        #      inverse edge via its has_inverse branch. ----
+        w_all = w_stack.view(S * B, C, H, W)
+        mask_all = torch.cat(mask_tiles, dim=0)                  # (S*B, 1, H, W)
+        w_all = (w_all * mask_all).contiguous()
+        U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
+    else:
+        # ---- comp_box=False: fully periodic. Enumerate each shift AND its
+        #      explicit inverse (-dx,-dy), both has_inverse=0, feeding the
+        #      pre-shifted inverse weight. The kernel does forward-only circular
+        #      gathers (no masking), reproducing the periodic symmetric operator
+        #      bit-for-bit. w_stack is UNMASKED here. ----
+        shift_list = self._collect_shifts()                      # [(dx,dy,has_inv)]
+        entries: List[torch.Tensor] = []
+        rows: List[Tuple[int, int, int]] = []
+        for i, (dx, dy, has_inv) in enumerate(shift_list):
+            w_fwd = w_stack[i]                                   # (B, C, H, W)
+            entries.append(w_fwd)
+            rows.append((int(dx), int(dy), 0))
+            if has_inv:
+                # w_inv[h,w] = w_fwd[(h-dx) % H, (w-dy) % W] == roll by (dx,dy).
+                # Matches the reference's F.pad-circular + inverse-slice exactly.
+                w_inv = torch.roll(w_fwd, shifts=(int(dx), int(dy)), dims=(2, 3))
+                entries.append(w_inv)
+                rows.append((-int(dx), -int(dy), 0))
+        M = len(entries)
+        w_all = torch.stack(entries, dim=0).reshape(M * B, C, H, W).contiguous()
+        shifts_periodic = torch.tensor(
+            rows, dtype=torch.int32, device=x.device)
+        U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_periodic)
 
-    # ---- Single fused U/Z accumulation (forward + inverse symmetry) ----
-    U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
     U = U_num / Z.clamp_min(1e-6)
 
     if not self.training:

@@ -1,4 +1,8 @@
-"""Route-1 CUDA patch for the Metropolis NeKDe denoiser (v2, finite window).
+"""Route-1 CUDA patch for the Metropolis NeKDe denoiser.
+
+The model's ``comp_box`` flag selects the boundary handling at runtime
+(comp_box=True -> finite-window mask, the old v2; comp_box=False -> purely
+periodic, the old v5), so a single patch covers both.
 
 Replaces the per-shift Python ``kernel_actions`` accumulation by the fused,
 symmetric-by-construction ``metropolis_aggregate`` op. Unlike an ``accumulate_uz``
@@ -17,7 +21,7 @@ compiled CUDA kernel when built.
 Usage
 -----
     from NKD_mp_drunet_attn_v2 import NeKDeMetropolisDRUNetAttn
-    from nkd_metropolis_attn_v2_patch import install_cuda_shift
+    from nkd_metropolis_attn_patch import install_cuda_shift
 
     install_cuda_shift(NeKDeMetropolisDRUNetAttn)
     model = NeKDeMetropolisDRUNetAttn(...).cuda()
@@ -35,9 +39,13 @@ import torch.nn.functional as F
 
 from neural_shift_cuda.metropolis import metropolis_aggregate
 
-# v2 uses a finite-window validity mask (wrap neighbours dropped); v5 is purely
-# periodic. This is the ONLY line that differs between the two patch files.
-_USE_BOX = True
+# The model's `comp_box` flag selects the boundary handling at runtime (this
+# replaces the former separate v5 patch):
+#   comp_box=True  -> finite-window validity mask (wrap-around neighbours
+#                     dropped); the old v2 behaviour.
+#   comp_box=False -> purely periodic (circulant); the old v5 behaviour.
+# It is read per-forward and forwarded to `metropolis_aggregate(use_box=...)`.
+# Instances without the attribute default to True (the historical behaviour).
 
 
 def _build_w_half(
@@ -94,8 +102,9 @@ def _forward_cuda(
         raise ValueError(f"x must have shape (B,C,H,W), got {tuple(x.shape)}.")
     w_half, shifts = _build_w_half(self, x, guide, sig)
     eps = max(self.metropolis_eps, torch.finfo(x.dtype).tiny)
+    use_box = bool(getattr(self, "comp_box", True))
     Wx, degree_hat = metropolis_aggregate(
-        w_half, x, shifts, use_box=_USE_BOX, eps=eps)
+        w_half, x, shifts, use_box=use_box, eps=eps)
     if return_D:
         return Wx, degree_hat
     return Wx, None
