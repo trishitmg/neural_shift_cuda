@@ -1,6 +1,6 @@
-# tests/test_gadsd_lightweight_patch.py
+# tests/test_gadsd_moments_patch.py
 #
-# Equivalence test for the GADSDLightweight integration patch.
+# Equivalence test for the GADSDMoments integration patch.
 #
 # The ops layer dispatches CUDA tensors to the compiled kernels and CPU
 # tensors to the bit-exact reference implementations, and the patch code is
@@ -17,7 +17,7 @@ import pathlib
 import pytest
 import torch
 
-from neural_shift_cuda.integration.gadsd_lightweight_patch import (
+from neural_shift_cuda.integration.gadsd_moments_patch import (
     _forward_cuda,
     _transform_weights_cuda,
     install_cuda_shift,
@@ -27,29 +27,29 @@ CUDA_OK = torch.cuda.is_available()
 requires_cuda = pytest.mark.skipif(not CUDA_OK, reason="CUDA not available")
 
 _CANDIDATES = [
-    os.environ.get("GADSD_LIGHTWEIGHT_PATH", ""),
-    "GADSD_lightweight.py",
+    os.environ.get("GADSD_MOMENTS_PATH", ""),
+    "GADSD_moments.py",
     str(pathlib.Path(__file__).resolve().parent.parent.parent /
-        "GADSD_lightweight.py"),
+        "GADSD_moments.py"),
 ]
 
 
 def _load_module():
     for p in _CANDIDATES:
         if p and os.path.exists(p):
-            spec = importlib.util.spec_from_file_location("gadsd_lightweight", p)
+            spec = importlib.util.spec_from_file_location("gadsd_moments", p)
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             return mod
-    pytest.skip("GADSD_lightweight.py not found; "
-                "set GADSD_LIGHTWEIGHT_PATH to enable.")
+    pytest.skip("GADSD_moments.py not found; "
+                "set GADSD_MOMENTS_PATH to enable.")
 
 
 def _make_model(mod, **kw):
     seed = kw.pop("seed", 0)
     defaults = dict(in_channels=3, window_rad=2)
     defaults.update(kw)
-    model = mod.GADSDLightweight(**defaults).double()
+    model = mod.GADSDMoments(**defaults).double()
     torch.manual_seed(seed)
     # Randomize so per-channel weights genuinely vary across configs.
     for p in model.parameters():
@@ -150,7 +150,7 @@ def test_gradient_equivalence_fp64(ckpt):
 
 def test_installer_routing_and_idempotence():
     mod = _load_module()
-    cls = mod.GADSDLightweight
+    cls = mod.GADSDMoments
     orig_forward = cls.forward
     orig_tw = cls._transform_weights
     try:
@@ -180,12 +180,12 @@ def test_installer_routing_and_idempotence():
 
 
 def test_installer_rejects_wrong_architecture():
-    class NotLightweight(torch.nn.Module):
+    class NotMoments(torch.nn.Module):
         def forward(self, x):
             return x
 
     with pytest.raises(AttributeError):
-        install_cuda_shift(NotLightweight)
+        install_cuda_shift(NotMoments)
 
 
 @requires_cuda
@@ -200,7 +200,7 @@ def test_forward_equivalence_cuda_fp64(name, kw, hw):
     with torch.no_grad():
         ref, _ = model(x, guide, sig=sig)
 
-    install_cuda_shift(mod.GADSDLightweight)
+    install_cuda_shift(mod.GADSDMoments)
     model_c = model.cuda()
     with torch.no_grad():
         out, _ = model_c(x.cuda(), guide.cuda(), sig=sig.cuda())

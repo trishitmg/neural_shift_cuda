@@ -1,10 +1,11 @@
 """
-Integration patch for GADSDLightweight (GADSD_lightweight) to use
+Integration patch for GADSDMoments (GADSD_moments) to use
 neural_shift_cuda kernels.
 
 Architecture
 ------------
-GADSDLightweight is the lightweight group-averaged DOUBLY-stochastic
+GADSDMoments (formerly GADSDLightweight in GADSD_lightweight.py; the model
+file is now GADSD_moments.py) is the lightweight group-averaged DOUBLY-stochastic
 denoiser::
 
     W x = sum_{g in G} alpha_g P_g x ,   alpha_g > 0, sum_g alpha_g = 1
@@ -59,9 +60,9 @@ permutation on both sides.
 
 Usage
 -----
-    from GADSD_lightweight import GADSDLightweight
-    from neural_shift_cuda.integration import install_cuda_shift_gadsd_lightweight
-    install_cuda_shift_gadsd_lightweight(GADSDLightweight)
+    from GADSD_moments import GADSDMoments
+    from neural_shift_cuda.integration import install_cuda_shift_gadsd_moments
+    install_cuda_shift_gadsd_moments(GADSDMoments)
 
 After this, every instance routes through the CUDA path when the input is on
 a CUDA device. To disable per-instance:
@@ -102,11 +103,11 @@ def _normalise_sigma_light(sig, reference: torch.Tensor):
     return sig
 
 
-def _lightweight_partition(self):
+def _moments_partition(self):
     """Split self.transforms into translation entries and 'other' (D4)
     entries, preserving original indices. Cached; keyed on the identity of the
     transforms list (built once in __init__)."""
-    cache = getattr(self, "_gadsdl_part_cache", None)
+    cache = getattr(self, "_gadsdm_part_cache", None)
     if cache is not None and cache[0] == id(self.transforms):
         return cache[1], cache[2]
     trans_meta: List[Tuple[int, int, int]] = []   # (orig_idx, dx, dy)
@@ -116,21 +117,21 @@ def _lightweight_partition(self):
             trans_meta.append((i, int(g.dx), int(g.dy)))
         else:
             other_meta.append((i, g))
-    self._gadsdl_part_cache = (id(self.transforms), trans_meta, other_meta)
+    self._gadsdm_part_cache = (id(self.transforms), trans_meta, other_meta)
     return trans_meta, other_meta
 
 
-def _lightweight_trans_shifts(self, trans_meta, device: torch.device) -> torch.Tensor:
+def _moments_trans_shifts(self, trans_meta, device: torch.device) -> torch.Tensor:
     """Cache the (St, 2) int32 NEGATED shift tensor (gather convention) on
     ``device`` -- see the 'Shift convention' note in the module docstring."""
-    cache = getattr(self, "_gadsdl_shift_cache", None)
+    cache = getattr(self, "_gadsdm_shift_cache", None)
     if (cache is not None and cache[0] == id(self.transforms)
             and cache[1] == device):
         return cache[2]
     rows = [(-dx, -dy) for (_, dx, dy) in trans_meta]
     shifts = (torch.tensor(rows, dtype=torch.int32, device=device)
               if rows else torch.empty(0, 2, dtype=torch.int32, device=device))
-    self._gadsdl_shift_cache = (id(self.transforms), device, shifts)
+    self._gadsdm_shift_cache = (id(self.transforms), device, shifts)
     return shifts
 
 
@@ -186,7 +187,7 @@ def _transform_weights_cuda(
     sigma,
     C: int,
 ) -> torch.Tensor:
-    """CUDA-accelerated drop-in for GADSDLightweight._transform_weights.
+    """CUDA-accelerated drop-in for GADSDMoments._transform_weights.
 
     Mirrors the reference chunk-for-chunk (same _choose_chunk_size, same
     descriptor slices, same grad-checkpoint condition, same head call, same
@@ -262,7 +263,7 @@ def _forward_cuda(
     sig=None,
     return_D: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """CUDA-accelerated drop-in for GADSDLightweight.forward.
+    """CUDA-accelerated drop-in for GADSDMoments.forward.
 
     Scores come from the (patched) self._transform_weights; normalization is
     the model's own _finalize_weights; only the group-averaged accumulation
@@ -296,8 +297,8 @@ def _forward_cuda(
     raw = self._transform_weights(phi, sigma_n, C)     # patched: shift_gather path
     weights = self._finalize_weights(raw)              # (B, S, C, 1, 1)
 
-    trans_meta, other_meta = _lightweight_partition(self)
-    trans_shifts = _lightweight_trans_shifts(self, trans_meta, x.device)  # (St, 2)
+    trans_meta, other_meta = _moments_partition(self)
+    trans_shifts = _moments_trans_shifts(self, trans_meta, x.device)  # (St, 2)
     St = trans_shifts.size(0)
 
     output = torch.zeros_like(x)
@@ -322,7 +323,7 @@ def _forward_cuda(
 # ---------------------------------------------------------------------------
 
 def install_cuda_shift(model_cls):
-    """Monkey-patch a GADSDLightweight class to use neural_shift_cuda.
+    """Monkey-patch a GADSDMoments class to use neural_shift_cuda.
     Idempotent.
 
     Patches BOTH `_transform_weights` (so `get_transform_weights` and any
@@ -336,7 +337,7 @@ def install_cuda_shift(model_cls):
     # Fail at install time, not mid-training, on a stale/absent binary.
     if torch.cuda.is_available():
         from neural_shift_cuda.ops import _require_cuda_ext
-        _require_cuda_ext("install_cuda_shift[gadsd_lightweight]",
+        _require_cuda_ext("install_cuda_shift[gadsd_moments]",
                           need_scalar=True)
 
     # This patch targets the lightweight stack-consuming-head GADSD.
@@ -344,14 +345,14 @@ def install_cuda_shift(model_cls):
                  "_finalize_weights", "pre_activation"):
         if not hasattr(model_cls, attr):
             raise AttributeError(
-                f"install_cuda_shift[gadsd_lightweight]: {model_cls.__name__} "
-                f"has no `{attr}` -- this patch targets GADSDLightweight "
+                f"install_cuda_shift[gadsd_moments]: {model_cls.__name__} "
+                f"has no `{attr}` -- this patch targets GADSDMoments "
                 f"(stack-consuming TinyPairwiseMomentHead, per-channel scalar "
                 f"weights). For the DRUNet-attn GADSD use "
                 f"install_cuda_shift_gadsd instead.")
     if hasattr(model_cls, "_pool_spatial"):
         raise AttributeError(
-            "install_cuda_shift[gadsd_lightweight]: this class has "
+            "install_cuda_shift[gadsd_moments]: this class has "
             "`_pool_spatial`, which marks the per-pixel-head DRUNet-attn "
             "GADSD -- use install_cuda_shift_gadsd for that architecture.")
 
