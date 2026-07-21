@@ -42,18 +42,19 @@ fuses. The new heads don't have that pattern.
 
 Cross-version compatibility
 ---------------------------
-v2, v3, and v4 of NKD_drunet_attn share:
-  * the same `_collect_shifts()` (S = 2R^2 + 2R + 1, half-plane + horizontal axis),
-  * the same `_halfplane_weights` signature
-    (phi_center, padded_phi, sigma, shifts) -> list of (B, n_heads, H, W),
-  * the same forward accumulation structure
-    (fwd weight -> comp_box -> +U,+Z; F.pad-circular -> inverse weight -> comp_box -> +U,+Z),
-  * the same `_mix_heads(w, C, head_mix_mat)` -> (B, C, H, W).
-This patch therefore applies to all three identically. Internal changes
-to AttentionWeightHead between versions (e.g. layer_norm placement,
-n_heads expansion in the control_sigmoid head, etc.) do not affect the
-patch because we only call `attn_head.logit(...)` / `attn_head.weight(...)`
-through their public signatures.
+Two branches, selected at runtime:
+  * NEW files (v2 with attn_impl/_gather_core, GQA n_kv_heads, softmax_impl):
+    weight computation is DELEGATED to the model's own `_halfplane_weights`
+    (which runs its projection-once gather path), so every weight-path
+    feature -- gather/loop, GQA, stacked/streaming softmax -- is inherited
+    automatically; only the U/Z accumulation is replaced by accumulate_uz.
+  * OLDER files (v3/v4 heads without _gather_core): the original
+    shift_gather + per-chunk `attn_head.logit(...)` / `attn_head.weight(...)`
+    path, unchanged. These heads are called through their stable public
+    signatures, so internal differences between versions do not matter.
+All versions share `_collect_shifts()` (S = 2R^2 + 2R + 1), the
+`_halfplane_weights` signature, the forward accumulation structure, and
+`_mix_heads(w, C, head_mix_mat)`.
 
 Usage
 -----
@@ -198,7 +199,84 @@ def _forward_cuda(
     use_box = bool(getattr(self, "comp_box", True))
 
     # ------------------------------------------------------------------
-    # Per-chunk weight computation.
+    # Fast path: NEW model API (files with attn_impl/_gather_core, i.e. the
+    # projection-once "gather" weight path, GQA via n_kv_heads, and
+    # softmax_impl selection). Delegate the weight computation to the
+    # model's own `_halfplane_weights`. Rationale:
+    #   * the model's gather path already computes q_proj/k_proj ONCE and
+    #     slices VIEWS of the padded projection per shift -- there is
+    #     nothing left for shift_gather to save on the weight side (a
+    #     materialized gather of K would cost n_heads*qk_ch channels per
+    #     shift vs feat_ch for phi, i.e. MORE memory, not less);
+    #   * re-implementing the weight math here is exactly what breaks when
+    #     the head changes. GQA is the concrete case: `_score` views k
+    #     with n_heads while a GQA k_proj emits n_kv_heads*qk_ch channels,
+    #     so the legacy branch below would crash on a GQA model.
+    #     Delegation stays correct for gather/loop, GQA, stacked/streaming
+    #     softmax, and any future weight-path change (the model guards its
+    #     own illegal combinations).
+    # The CUDA value-add of this patch -- fusing the U/Z accumulation and
+    # inverse-symmetry loop into one accumulate_uz launch -- is unchanged.
+    # softmax_impl='streaming' is honoured inside _halfplane_weights and is
+    # numerically identical to 'stacked', so nothing downstream changes.
+    # ------------------------------------------------------------------
+    if hasattr(self, "_gather_core"):
+        shift_list = self._collect_shifts()
+        padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
+        weights_list = self._halfplane_weights(
+            phi, padded_phi, sig, shift_list)
+        # per-shift tensors are (B, n_heads, H, W) -> (S, B, h, H, W)
+        w_stack = torch.stack(list(weights_list), dim=0)
+
+        # Head-mix to per-channel weights: (S, B, h, H, W) -> (S, B, C, H, W)
+        w_stack = _mix_heads_vec(w_stack, C, head_mix_mat)
+
+        if use_box:
+            # comp_box mask per shift, built exactly like the reference's
+            # zero-padded `ones` box. The mask depends only on the shift, so
+            # (S, 1, 1, H, W) broadcasts over B and C -- no (S*B, 1, H, W)
+            # materialization needed.
+            box = F.pad(
+                torch.ones(1, 1, H, W, device=x.device, dtype=x.dtype),
+                (R, R, R, R), mode="constant", value=0.0)
+            mask_stack = torch.stack(
+                [box[:, :, R + dx: R + dx + H, R + dy: R + dy + W]
+                 for (dx, dy, _) in shift_list], dim=0)   # (S, 1, 1, H, W)
+            w_all = (w_stack * mask_stack).reshape(
+                S * B, C, H, W).contiguous()
+            U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
+        else:
+            # Fully periodic: same explicit-inverse enumeration as the
+            # legacy branch (has_inverse=0 rows; kernel does forward-only
+            # circular gathers with no masking). w_stack is UNMASKED here.
+            entries: List[torch.Tensor] = []
+            rows: List[Tuple[int, int, int]] = []
+            for i, (dx, dy, has_inv) in enumerate(shift_list):
+                w_fwd = w_stack[i]                           # (B, C, H, W)
+                entries.append(w_fwd)
+                rows.append((int(dx), int(dy), 0))
+                if has_inv:
+                    w_inv = torch.roll(
+                        w_fwd, shifts=(int(dx), int(dy)), dims=(2, 3))
+                    entries.append(w_inv)
+                    rows.append((-int(dx), -int(dy), 0))
+            M = len(entries)
+            w_all = torch.stack(entries, dim=0).reshape(
+                M * B, C, H, W).contiguous()
+            shifts_periodic = torch.tensor(
+                rows, dtype=torch.int32, device=x.device)
+            U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_periodic)
+
+        U = U_num / Z.clamp_min(1e-6)
+        if not self.training:
+            self.max_batch_shifts = None
+        if return_D:
+            return U, Z
+        return U, None
+
+    # ------------------------------------------------------------------
+    # Legacy per-chunk weight computation (older model files without the
+    # _gather_core API).
     #
     # For each chunk:
     #   1. shift_gather(phi, shifts_chunk) -> (n*B, F, H, W) gathered phi_s,
