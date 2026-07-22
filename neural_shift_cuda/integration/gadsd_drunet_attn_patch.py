@@ -16,17 +16,24 @@ image. ``_finalize_weights`` normalizes over the transform axis PER CHANNEL
 (sum_g alpha_g = 1 for each channel), so W is exactly stochastic and the degree
 map Z is identically one (no U/Z division).
 
-This is a drop-in replacement for ``forward``. Same math, same gradients, but:
+This is a drop-in replacement for ``forward``. Same math, same gradients. The
+per-channel weighted accumulation loop ``U += alpha_g * P_g x`` is replaced, for
+the TRANSLATION transforms, by a single fused ``accumulate_uz_scalar`` call with
+(St, B, C) weights -- one scalar per (transform, image, channel), never
+materialized per-pixel. The kernel's Z output is discarded (weights are
+pre-normalized, so there is no division).
 
-  * the per-transform feature gather ``torch.cat([g.apply(phi) for g ...])``
-    inside ``_transform_weights`` is replaced, for the TRANSLATION transforms,
-    by a single ``shift_gather`` CUDA kernel per chunk (no per-shift
-    ``torch.roll`` and no ``torch.cat``);
-  * the per-channel weighted accumulation loop ``U += alpha_g * P_g x`` in
-    ``forward`` is replaced, for the TRANSLATION transforms, by a single fused
-    ``accumulate_uz_scalar`` call with (St, B, C) weights -- one scalar per
-    (transform, image, channel), never materialized per-pixel. The kernel's Z
-    output is discarded (weights are pre-normalized, so there is no division).
+Weight computation has two branches:
+  * NEW files (with attn_impl/_transform_weights_gather): the raw per-transform
+    scalars are delegated to the model's own ``_transform_weights`` (its
+    projection-once gather path -- q/k projected once, each transform applied to
+    the projected K), so GQA (n_kv_heads) is inherited and no longer crashes the
+    per-transform head call, whose ``_score`` view assumes n_heads keys.
+  * OLDER files (no _transform_weights_gather): the per-transform feature gather
+    ``torch.cat([g.apply(phi) for g ...])`` is replaced, for the TRANSLATION
+    transforms, by a single ``shift_gather`` CUDA kernel per chunk (no per-shift
+    ``torch.roll`` and no ``torch.cat``); the head is called through its stable
+    ``logit``/``weight`` API.
 
 D4 transforms (``rot90``/``flip``/``transpose`` ...) are index permutations, not
 translations, so they are handled with the model's own ``g.apply`` in a small
@@ -168,57 +175,77 @@ def _forward_cuda(
 
     trans_meta, other_meta = _gadsd_transform_partition(self)
     S = len(self.transforms)
-    chunk = self.max_batch_shifts if self.max_batch_shifts is not None else max(S, 1)
 
-    head_fn = (self.attn_head.logit
-               if self.output_activation == "softmax"
-               else self.attn_head.weight)
-    head_mix_mat = self._head_mix_mat()
-
-    # Per-channel weight tile (B, C, 1, 1) per transform, placed by orig index.
-    # Per-chunk pipeline mirrors _transform_weights: head -> _mix_heads
-    # (per-pixel, heads -> C channels) -> _pool_spatial over (H, W).
-    chan_tiles: List[Optional[torch.Tensor]] = [None] * S
-
-    # ---- (a) translation transforms: shift_gather + chunked head ----
+    # Translation shift tensor + count are consumed by the accumulation below in
+    # both the delegated and legacy paths, so resolve them up-front.
     trans_shifts = _gadsd_trans_shifts(self, trans_meta, x.device)   # (St, 2) int32
     St = trans_shifts.size(0)
-    for start in range(0, St, chunk):
-        end = min(start + chunk, St)
-        n = end - start
-        shifts_chunk = trans_shifts[start:end].contiguous()
-        phi_s_batch, _ = shift_gather(phi, shifts_chunk)            # (n*B, F, H, W)
-        phi_c_batch = phi.repeat(n, 1, 1, 1)
-        sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
 
-        m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
-                      self.use_grad_checkpoint)                     # (n*B, h, H, W)
-        m = self._mix_heads(m, C, head_mix_mat)                    # (n*B, C, H, W)
-        m = self._pool_spatial(m)                                  # (n*B, C, 1, 1)
-        for j, tile in enumerate(m.split(B, dim=0)):
-            chan_tiles[trans_meta[start + j][0]] = tile
+    if hasattr(self, "_transform_weights_gather"):
+        # ---- Fast path: delegate weight computation to the model's
+        #      projection-once gather. `_transform_weights` returns the SAME
+        #      (B, S, C, 1, 1) raw scores this function used to build by hand
+        #      (raw logits for softmax, clamped affinities for control_sigmoid),
+        #      so `_finalize_weights` + the accumulation below are unchanged.
+        #      This inherits GQA (n_kv_heads) -- whose k_proj emits
+        #      n_kv_heads*qk_ch channels that the per-transform `_score` view
+        #      cannot reshape, so the legacy head call crashed on it -- and any
+        #      future weight-path change. The CUDA value-add (fused
+        #      accumulate_uz_scalar over the translation transforms) is kept.
+        raw = self._transform_weights(phi, sig, C)                 # (B, S, C, 1, 1)
+    else:
+        # ---- Legacy path: recompute per-transform weights via the head's
+        #      public logit/weight API (older model files without
+        #      _transform_weights_gather). ----
+        chunk = (self.max_batch_shifts if self.max_batch_shifts is not None
+                 else max(S, 1))
+        head_fn = (self.attn_head.logit
+                   if self.output_activation == "softmax"
+                   else self.attn_head.weight)
+        head_mix_mat = self._head_mix_mat()
 
-    # ---- (b) D4 / other transforms: torch permutation + chunked head ----
-    for start in range(0, len(other_meta), chunk):
-        grp = other_meta[start:start + chunk]
-        n = len(grp)
-        phi_s_batch = torch.cat([g.apply(phi) for (_, g) in grp], dim=0)
-        phi_c_batch = phi.repeat(n, 1, 1, 1)
-        sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
+        # Per-channel weight tile (B, C, 1, 1) per transform, by orig index.
+        # Per-chunk pipeline mirrors _transform_weights: head -> _mix_heads
+        # (per-pixel, heads -> C channels) -> _pool_spatial over (H, W).
+        chan_tiles: List[Optional[torch.Tensor]] = [None] * S
 
-        m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
-                      self.use_grad_checkpoint)
-        m = self._mix_heads(m, C, head_mix_mat)
-        m = self._pool_spatial(m)
-        for j, tile in enumerate(m.split(B, dim=0)):
-            chan_tiles[grp[j][0]] = tile
+        # (a) translation transforms: shift_gather + chunked head
+        for start in range(0, St, chunk):
+            end = min(start + chunk, St)
+            n = end - start
+            shifts_chunk = trans_shifts[start:end].contiguous()
+            phi_s_batch, _ = shift_gather(phi, shifts_chunk)        # (n*B, F, H, W)
+            phi_c_batch = phi.repeat(n, 1, 1, 1)
+            sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
 
-    aff = torch.stack(chan_tiles, dim=1)                           # (B, S, C, 1, 1)
+            m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
+                          self.use_grad_checkpoint)                 # (n*B, h, H, W)
+            m = self._mix_heads(m, C, head_mix_mat)                # (n*B, C, H, W)
+            m = self._pool_spatial(m)                              # (n*B, C, 1, 1)
+            for j, tile in enumerate(m.split(B, dim=0)):
+                chan_tiles[trans_meta[start + j][0]] = tile
 
-    # Raw scores exactly as _transform_weights returns them: raw logits for
-    # 'softmax', clamped positive affinities for 'control_sigmoid'; then the
-    # model's own per-channel transform-axis normalization (sum_g w_g = 1).
-    raw = aff if self.output_activation == "softmax" else aff.clamp_min(1e-8)
+        # (b) D4 / other transforms: torch permutation + chunked head
+        for start in range(0, len(other_meta), chunk):
+            grp = other_meta[start:start + chunk]
+            n = len(grp)
+            phi_s_batch = torch.cat([g.apply(phi) for (_, g) in grp], dim=0)
+            phi_c_batch = phi.repeat(n, 1, 1, 1)
+            sig_batch = sig.repeat(n, 1, 1, 1) if sig is not None else None
+
+            m = _run_head(head_fn, phi_c_batch, phi_s_batch, sig_batch,
+                          self.use_grad_checkpoint)
+            m = self._mix_heads(m, C, head_mix_mat)
+            m = self._pool_spatial(m)
+            for j, tile in enumerate(m.split(B, dim=0)):
+                chan_tiles[grp[j][0]] = tile
+
+        aff = torch.stack(chan_tiles, dim=1)                       # (B, S, C, 1, 1)
+        # Raw scores exactly as _transform_weights returns them.
+        raw = aff if self.output_activation == "softmax" \
+            else aff.clamp_min(1e-8)
+
+    # Model's own per-channel transform-axis normalization (sum_g w_g = 1).
     w = self._finalize_weights(raw)                                # (B, S, C, 1, 1)
 
     # ------------------------------------------------------------------

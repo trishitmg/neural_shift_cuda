@@ -5,12 +5,16 @@ neural_shift_cuda kernels.
 What this is
 ------------
 A drop-in replacement for the `forward` method of v2's `GASDDRUNetAttn`.
-Same math, same gradients, but:
-  * the F.pad + Python list-comprehension shift gather inside
-    `_all_shift_weights` is replaced by `shift_gather` (one CUDA kernel
-    per chunk, no padded_phi materialization),
-  * the per-shift U/Z accumulation loop in `forward` (including the per-shift
-    `comp_box` masking) is replaced by a single `accumulate_uz` kernel call.
+Same math, same gradients. Two branches:
+  * NEW files (with attn_impl/_gather_core): weight computation is delegated to
+    the model's own `_all_shift_weights` (its projection-once gather path), so
+    GQA (n_kv_heads) and stacked/streaming softmax are inherited automatically;
+    the per-shift U/Z accumulation loop (including comp_box masking) is replaced
+    by a single `accumulate_uz` kernel call (has_inverse=0 -> row-stochastic).
+  * OLDER files (no _gather_core): the F.pad + list-comprehension shift gather
+    inside `_all_shift_weights` is replaced by `shift_gather` (one CUDA kernel
+    per chunk, no padded_phi materialization); the head is called through its
+    stable `logit`/`weight` API and the accumulation is likewise fused.
 
 GASD vs NeKDe (why this is a separate patch)
 --------------------------------------------
@@ -191,7 +195,44 @@ def _forward_cuda(
     use_box = bool(getattr(self, "comp_box", True))
 
     # ------------------------------------------------------------------
-    # Per-chunk weight computation.
+    # Fast path: delegate weight computation to the model's projection-once
+    # gather (new files with attn_impl/_gather_core). Bit-exact to the legacy
+    # chunked recompute for non-GQA models, and CORRECT for GQA (n_kv_heads),
+    # which the legacy `attn_head.logit/weight` per-shift call cannot handle
+    # (its per-shift `_score` reshapes k with n_heads, while a GQA k_proj emits
+    # n_kv_heads*qk_ch channels). streaming softmax, if selected, is honoured
+    # inside the model's `_all_shift_weights`. Only the U/Z accumulation stays
+    # fused via accumulate_uz (has_inverse=0 -> forward-only, row-stochastic).
+    # ------------------------------------------------------------------
+    if hasattr(self, "_gather_core"):
+        shifts_list = self._collect_shifts()                     # [(dx, dy), ...]
+        padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
+        weights_list = self._all_shift_weights(
+            phi, padded_phi, sig, shifts_list)
+        w_stack = torch.stack(list(weights_list), dim=0)         # (S, B, h, H, W)
+        w_stack = _mix_heads_vec(w_stack, C, head_mix_mat)       # (S, B, C, H, W)
+        if use_box:
+            # comp_box mask, built exactly like the model's zero-padded `ones`
+            # box; depends only on the shift, so (S, 1, 1, H, W) broadcasts.
+            box = F.pad(
+                torch.ones(1, 1, H, W, device=x.device, dtype=x.dtype),
+                (R, R, R, R), mode="constant", value=0.0)
+            mask_stack = torch.stack(
+                [box[:, :, R + dx: R + dx + H, R + dy: R + dy + W]
+                 for (dx, dy) in shifts_list], dim=0)            # (S, 1, 1, H, W)
+            w_stack = w_stack * mask_stack
+        w_all = w_stack.reshape(S * B, C, H, W).contiguous()
+        U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
+        U = U_num / Z.clamp_min(1e-6)
+        if not self.training:
+            self.max_batch_shifts = None
+        if return_D:
+            return U, Z
+        return U, None
+
+    # ------------------------------------------------------------------
+    # Legacy per-chunk weight computation (older model files without
+    # _gather_core).
     #
     # For each chunk:
     #   1. shift_gather(phi, shifts_chunk) -> (n*B, F, H, W) gathered phi_s,
