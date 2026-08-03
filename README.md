@@ -5,24 +5,57 @@ DSG-NLM forward of the NeKDe-family denoisers. Each op has a pure-PyTorch CPU
 fallback and full autograd; the compiled kernel is used on CUDA at inference,
 the reference path during training.
 
-- Official model / paper repo: https://github.com/arghyasinha/nectr
-- Paper: https://openreview.net/forum?id=Z6j8S5LWmL
-
 The kernels are installed as drop-in patches: they monkey-patch a model class's
 `forward` to route through the CUDA ops without changing any math, parameters,
 or outputs (bit-exact against the reference within fp tolerance).
 
+## How the parallelization works
+
+These denoisers restore an image by, for every pixel, looking at a small window
+of neighbouring pixels and replacing the pixel with a *weighted average* of
+them — where the weights are produced by a small neural network that judges how
+similar each neighbour is. A window of radius `R` has `S = 2*R^2 + 2*R + 1`
+distinct neighbour offsets, which we call *shifts*.
+
+The reference implementation walks these shifts one at a time in a Python loop:
+for each shift it slides the image by that offset, runs the weight network, and
+adds the result into a running numerator `U` and normaliser `Z`. That means `S`
+separate passes, each launching many tiny GPU operations with Python overhead in
+between, so the GPU spends most of its time waiting between small launches rather
+than computing.
+
+`neural_shift_cuda` replaces that loop with a few fused CUDA kernels that handle
+all shifts together:
+
+- **Gather once.** `shift_gather` / `pair_gather` collect every shifted neighbour
+  window (and the border-validity mask) in a single kernel, instead of padding
+  and slicing `S` times.
+- **Score once.** The weight network then runs a single time on the whole stack
+  of shifts rather than `S` times.
+- **Accumulate once, using symmetry.** `accumulate_uz` (or `metropolis_aggregate`
+  for the Metropolis variant) sums each shift's weighted contribution into `U`
+  and `Z` in one fused kernel. Because the kernel is symmetric — a shift and its
+  mirror share the same weight — only about half the shifts need a network
+  evaluation; the mirror contribution is recovered by an inverse shift *inside*
+  the kernel.
+
+The net effect is a handful of large, GPU-friendly kernel launches instead of
+hundreds of small serialized ones, so the GPU stays busy. The math is unchanged
+(outputs match the reference to fp tolerance), and because the fused kernels are
+differentiable the speed-up carries through the backward pass — which is why it
+shows up directly as more training iterations per second.
+
 ## Supported model archs
 
 CUDA parallel patches are currently available for the three latest attention
-denoisers:
+denoisers plus the original model:
 
-| Model arch | Class (source) | Installer | Kernel |
-|---|---|---|---|
-| NeKDe attn | `NeKDeDRUNetAttn` (`NKD_drunet_attn_v2.py`, v2/v3/v4) | `install_cuda_shift_attn` | `accumulate_uz` |
-| GASD attn | `GASDDRUNetAttn` (`GASD_drunet_attn_v2.py`) | `install_cuda_shift_gasd` | `accumulate_uz` |
-| NKD_mp attn | `NeKDeMetropolisDRUNetAttn` (`NKD_mp_drunet_attn_v2.py`) | `install_cuda_shift_metropolis` | `metropolis_aggregate` |
-| NECTR (original) | `nekre` (`NKD_models_symm.py`) | `install_cuda_shift_nekre` | `shift_gather`, `pair_gather`, `accumulate_uz` |
+| Model arch | Class (source) | Installer | Kernel | Paper Link and Code |
+|---|---|---|---|---|
+| NeKDe attn | `NeKDeDRUNetAttn` (`NKD_drunet_attn_v2.py`, v2/v3/v4) | `install_cuda_shift_attn` | `accumulate_uz` | _to be updated soon_ |
+| GASD attn | `GASDDRUNetAttn` (`GASD_drunet_attn_v2.py`) | `install_cuda_shift_gasd` | `accumulate_uz` | _to be updated soon_ |
+| NKD_mp attn | `NeKDeMetropolisDRUNetAttn` (`NKD_mp_drunet_attn_v2.py`) | `install_cuda_shift_metropolis` | `metropolis_aggregate` | _to be updated soon_ |
+| NECTR (original) | `nekre` (`NKD_models_symm.py`) | `install_cuda_shift_nekre` | `shift_gather`, `pair_gather`, `accumulate_uz` | [![arXiv](https://img.shields.io/badge/arXiv-2607.23347-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2607.23347) [![Code](https://img.shields.io/badge/Code-181717?logo=github&logoColor=white)](https://github.com/arghyasinha/nectr) |
 
 - **NeKDe attn** — half-plane shifts, per-pixel weights, inverse-symmetry. The
   model's `comp_box` flag is read per-forward (True → finite-window mask; False →
@@ -113,6 +146,50 @@ install_cuda_shift_nekre(nekre)
 ```
 
 Force the reference PyTorch path per instance: `model.use_cuda_shift = False`.
+
+## Benchmarks
+
+Serial (reference PyTorch per-shift loop) vs parallel (`neural_shift_cuda`) on
+the same GPU, measured with `tests/benchmark_archs.py`. **All four models use
+identical settings: batch size `B = 8`, image size `64 x 64`, window radius
+`R = 5`, `fp32`.** Rows are the stages of a training step; the columns give the
+median wall-clock time of each path and their ratio (serial ÷ parallel). Higher
+speed-up is better; the **full step (fwd+bwd)** row is what training
+iterations/second track.
+
+### NeKDe attn
+| Stage | Serial (ms) | Parallel (ms) | Speed-up |
+|---|--:|--:|--:|
+| Forward (inference) | 19.17 | 12.45 | 1.54× |
+| Forward (train) | 24.15 | 12.32 | 1.96× |
+| Backward | 116.22 | 50.72 | 2.29× |
+| **Full step (fwd+bwd)** | **140.37** | **63.03** | **2.23×** |
+
+### GASD attn
+| Stage | Serial (ms) | Parallel (ms) | Speed-up |
+|---|--:|--:|--:|
+| Forward (inference) | 22.33 | 21.09 | 1.06× |
+| Forward (train) | 25.56 | 20.97 | 1.22× |
+| Backward | 151.45 | 113.83 | 1.33× |
+| **Full step (fwd+bwd)** | **177.02** | **134.81** | **1.31×** |
+
+### NKD_mp attn
+| Stage | Serial (ms) | Parallel (ms) | Speed-up |
+|---|--:|--:|--:|
+| Forward (inference) | 34.32 | 12.73 | 2.70× |
+| Forward (train) | 43.94 | 15.41 | 2.85× |
+| Backward | 148.99 | 75.61 | 1.97× |
+| **Full step (fwd+bwd)** | **192.92** | **91.02** | **2.12×** |
+
+### NECTR (original)
+| Stage | Serial (ms) | Parallel (ms) | Speed-up |
+|---|--:|--:|--:|
+| Forward (inference) | 91.00 | 82.92 | 1.10× |
+| Forward (train) | 91.19 | 82.91 | 1.10× |
+| Backward | 226.17 | 167.65 | 1.35× |
+| **Full step (fwd+bwd)** | **317.36** | **250.56** | **1.27×** |
+
+Reproduce with `python tests/benchmark_archs.py --config tests/configs/<arch>.yaml`.
 
 ## Test
 
