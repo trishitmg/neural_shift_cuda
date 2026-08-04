@@ -296,6 +296,80 @@ def _forward_cuda(
     return U, None
 
 
+
+# ---------------------------------------------------------------------------
+# K^T action (NEW). K = K^T for NeKDe (half-plane + circular-shift twin), so
+# K^T y is the SAME symmetric accumulation the forward uses -- NO new kernel
+# is required. One network pass; apply_Dinv costs one extra accumulate_uz
+# launch (weights reused), never a second network pass.
+# ---------------------------------------------------------------------------
+
+def _kt_action_cuda(self, y, guide=None, sig=None,
+                    return_D=False, apply_Dinv=False):
+    """CUDA drop-in for the arch-level `_KT_action`:
+
+        K^T y          (apply_Dinv=False)
+        K^T D^{-1} y   (apply_Dinv=True), D = K e = Z from the first launch.
+
+    comp_box=True  -> pre-masked forward weights + (S, 3) has_inverse rows
+                      (kernel masks the inverse edge), exactly like forward.
+    comp_box=False -> explicit-inverse M-row enumeration with has_inverse=0
+                      (same periodic trick as _forward_cuda).
+    """
+    if not self.training:
+        self.max_batch_shifts = 10
+
+    B, C, H, W = y.shape
+    R = self.window_rad
+
+    sig = _normalise_sigma_patch(sig, y)
+
+    g_input = y if guide is None else guide
+    phi = self.pre_activation(g_input, sigma=sig).contiguous()
+
+    shift_list = self._collect_shifts()
+    padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
+    weights_list = self._halfplane_weights(
+        phi, padded_phi, sig, shift_list)                        # ONE network pass
+    w_stack = _mix_heads_vec(
+        torch.stack(list(weights_list), dim=0), C, _head_mix_mat(self))
+
+    if bool(getattr(self, "comp_box", True)):
+        box = F.pad(
+            torch.ones(1, 1, H, W, device=y.device, dtype=y.dtype),
+            (R, R, R, R), mode="constant", value=0.0)
+        mask_stack = torch.stack(
+            [box[:, :, R + dx: R + dx + H, R + dy: R + dy + W]
+             for (dx, dy, _) in shift_list], dim=0)              # (S, 1, 1, H, W)
+        S = len(shift_list)
+        w_all = (w_stack * mask_stack).reshape(S * B, C, H, W).contiguous()
+        shifts_used = _get_shift_tensor(self, y.device)          # (S, 3), real flags
+    else:
+        entries: List[torch.Tensor] = []
+        rows: List[Tuple[int, int, int]] = []
+        for i, (dx, dy, has_inv) in enumerate(shift_list):
+            entries.append(w_stack[i])
+            rows.append((int(dx), int(dy), 0))
+            if has_inv:
+                entries.append(torch.roll(
+                    w_stack[i], shifts=(int(dx), int(dy)), dims=(2, 3)))
+                rows.append((-int(dx), -int(dy), 0))
+        M = len(entries)
+        w_all = torch.stack(entries, dim=0).reshape(
+            M * B, C, H, W).contiguous()
+        shifts_used = torch.tensor(rows, dtype=torch.int32, device=y.device)
+
+    # First launch: (K y, Z = D). D never needs a network pass of its own.
+    U, Z = accumulate_uz(y.contiguous(), w_all, shifts_used)
+    if apply_Dinv:
+        U, _ = accumulate_uz(
+            (y / Z.clamp_min(1e-6)).contiguous(), w_all, shifts_used)
+
+    if not self.training:
+        self.max_batch_shifts = None
+    return (U, Z) if return_D else (U, None)
+
+
 # ---------------------------------------------------------------------------
 # Public installer
 # ---------------------------------------------------------------------------
@@ -352,5 +426,27 @@ def install_cuda_shift(model_cls):
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward
+
+    # ---- K^T wiring (arch-level _KT_action / NLM_transpose route here) ----
+    _orig_kt = getattr(model_cls, "_KT_action", None)
+
+    def patched_kt_action(self, y, guide=None, sig=None,
+                          return_D=False, apply_Dinv=False):
+        if not hasattr(self, "_cached_shift_tensor"):
+            self.use_cuda_shift = True
+            self._cached_shift_tensor = None
+            self._cached_shift_device = None
+        if getattr(self, "use_cuda_shift", True) and y.is_cuda:
+            return _kt_action_cuda(self, y, guide=guide, sig=sig,
+                                   return_D=return_D, apply_Dinv=apply_Dinv)
+        if _orig_kt is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no reference _KT_action; add the "
+                "arch-level _KT_action/NLM_transpose before installing.")
+        return _orig_kt(self, y, guide=guide, sig=sig,
+                        return_D=return_D, apply_Dinv=apply_Dinv)
+
+    model_cls._KT_action = patched_kt_action
+
     model_cls._cuda_shift_installed = True
     return model_cls

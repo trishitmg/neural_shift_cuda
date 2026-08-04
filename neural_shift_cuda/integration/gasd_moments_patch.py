@@ -265,6 +265,141 @@ def _forward_cuda(
     return U, None
 
 
+
+# ---------------------------------------------------------------------------
+# K^T action (NEW). GASD's K is only row-stochastic (K != K^T), so a genuine
+# transpose is required (laplacian_grw's reverse factor). The ICC identity
+#     pi^{-1}(w (.) y) = pi^{-1}(w) (.) pi^{-1}(y)
+# turns K^T y = sum_pi pi^{-1}(w_pi (.) y) into a FORWARD-style accumulation
+# with NEGATED shifts and inverse-ROLLED weights -- so the same validated
+# accumulate_uz kernel does the work (has_inverse=0 rows; no new CUDA code).
+# ---------------------------------------------------------------------------
+
+def _get_kt_shift_tensor(self, device: torch.device) -> torch.Tensor:
+    """(S, 3) int32 with every (dx, dy) NEGATED and the inverse flag 0."""
+    if (getattr(self, "_cached_kt_shift_tensor", None) is None
+            or getattr(self, "_cached_kt_shift_device", None) != device):
+        rows = [(-int(dx), -int(dy), 0) for (dx, dy) in self._collect_shifts()]
+        self._cached_kt_shift_tensor = torch.tensor(
+            rows, dtype=torch.int32, device=device)
+        self._cached_kt_shift_device = device
+    return self._cached_kt_shift_tensor
+
+
+def _get_roll_index(self, S: int, H: int, W: int,
+                    device: torch.device) -> torch.Tensor:
+    """Cached flat gather index for the per-shift inverse roll
+    out[s, ..., h, w] = w[s, ..., (h - dx_s) % H, (w - dy_s) % W]."""
+    key = (S, H, W, str(device))
+    if getattr(self, "_cached_kt_roll_key", None) != key:
+        d = torch.tensor(self._collect_shifts(), device=device)   # (S, 2)
+        hh = torch.arange(H, device=device).view(1, H, 1)
+        ww = torch.arange(W, device=device).view(1, 1, W)
+        src_h = (hh - d[:, 0].view(S, 1, 1)) % H
+        src_w = (ww - d[:, 1].view(S, 1, 1)) % W
+        self._cached_kt_roll_index = (
+            src_h * W + src_w).reshape(S, 1, 1, H * W)
+        self._cached_kt_roll_key = key
+    return self._cached_kt_roll_index
+
+
+def _roll_stack(self, w_stack: torch.Tensor) -> torch.Tensor:
+    """pi_s^{-1} applied to slice s of (S, B, C, H, W) in a single gather
+    (the expanded index is stride-0: no (S, B, C, H*W) materialization)."""
+    S, B, C, H, W = w_stack.shape
+    idx = _get_roll_index(self, S, H, W, w_stack.device)
+    return w_stack.reshape(S, B, C, H * W).gather(
+        3, idx.expand(S, B, C, H * W)).view_as(w_stack)
+
+
+def _kt_weight_stack(self, ref: torch.Tensor, guide, sig) -> torch.Tensor:
+    """ONE network pass -> comp_box-masked per-shift weights (S, B, C, H, W).
+    Same construction as the forward (delegates to the model's own
+    _all_shift_weights), so K and K^T are built from identical entries."""
+    B, C, H, W = ref.shape
+    R = self.window_rad
+    g_input = ref if guide is None else guide
+    phi = self.pre_activation(g_input, sigma=sig).contiguous()
+    padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
+    shift_list = self._collect_shifts()
+    weights_list = self._all_shift_weights(phi, padded_phi, sig, shift_list)
+    w_stack = _mix_heads_vec(
+        torch.stack(list(weights_list), dim=0), C, _head_mix_mat(self))
+    if bool(getattr(self, "comp_box", True)):
+        box = F.pad(
+            torch.ones(1, 1, H, W, device=ref.device, dtype=ref.dtype),
+            (R, R, R, R), mode="constant", value=0.0)
+        mask_stack = torch.stack(
+            [box[:, :, R + dx: R + dx + H, R + dy: R + dy + W]
+             for (dx, dy) in shift_list], dim=0)                 # (S, 1, 1, H, W)
+        w_stack = w_stack * mask_stack
+    return w_stack
+
+
+def _kt_action_cuda(self, y, guide=None, sig=None):
+    """CUDA drop-in for the arch-level `_KT_action`: K^T y."""
+    if not self.training:
+        self.max_batch_shifts = 10
+    B, C, H, W = y.shape
+    sig = _normalise_sigma_patch(sig, y)
+
+    w_stack = _kt_weight_stack(self, y, guide, sig)
+    S = w_stack.shape[0]
+    w_t = _roll_stack(self, w_stack).reshape(S * B, C, H, W).contiguous()
+    KT_y, _ = accumulate_uz(
+        y.contiguous(), w_t, _get_kt_shift_tensor(self, y.device))
+    if not self.training:
+        self.max_batch_shifts = None
+    return KT_y
+
+
+def _nlm_transpose_cuda(self, x, guide=None, sig=None, return_D=False):
+    """W^T x = K^T D^{-1} x in ONE network pass (the arch reference spends
+    two: forward for D, then _KT_action). D = row degree = masked-stack
+    sum over the shift axis, identical to forward's Z."""
+    if not self.training:
+        self.max_batch_shifts = 10
+    B, C, H, W = x.shape
+    sig = _normalise_sigma_patch(sig, x)
+
+    g = x if guide is None else guide
+    w_stack = _kt_weight_stack(self, x, g, sig)
+    S = w_stack.shape[0]
+    D = w_stack.sum(dim=0)                                       # = forward Z
+    w_t = _roll_stack(self, w_stack).reshape(S * B, C, H, W).contiguous()
+    WT_x, _ = accumulate_uz(
+        (x / D.clamp_min(1e-6)).contiguous(), w_t,
+        _get_kt_shift_tensor(self, x.device))
+    if not self.training:
+        self.max_batch_shifts = None
+    return (WT_x, D) if return_D else (WT_x, None)
+
+
+def _laplacian_grw_cuda(self, x, guide, sig=None, eps=1e-10):
+    """L_rw^T L_rw x, L_rw = I - D^{-1}K, in ONE network pass: the same weight
+    stack feeds the forward accumulate (K) and, rolled, the transpose
+    accumulate (K^T). The arch reference spends two network passes."""
+    if not self.training:
+        self.max_batch_shifts = 10
+    B, C, H, W = x.shape
+    sig = _normalise_sigma_patch(sig, x)
+
+    g = x if guide is None else guide
+    w_stack = _kt_weight_stack(self, x, g, sig)
+    S = w_stack.shape[0]
+    w_all = w_stack.reshape(S * B, C, H, W).contiguous()
+    U_num, Z = accumulate_uz(
+        x.contiguous(), w_all, _get_shift_tensor(self, x.device))
+    z = x - U_num / Z.clamp_min(1e-6)                            # L_rw x
+    w_t = _roll_stack(self, w_stack).reshape(S * B, C, H, W).contiguous()
+    KT, _ = accumulate_uz(
+        (z / Z.clamp_min(1e-6)).contiguous(), w_t,
+        _get_kt_shift_tensor(self, x.device))
+    if not self.training:
+        self.max_batch_shifts = None
+    return z - KT
+
+
 # ---------------------------------------------------------------------------
 # Public installer
 # ---------------------------------------------------------------------------
@@ -321,5 +456,54 @@ def install_cuda_shift(model_cls):
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward
+
+    # ---- K^T wiring: _KT_action, plus single-network-pass NLM_transpose and
+    # laplacian_grw overrides (their arch references each spend TWO network
+    # passes: forward for D/Wx, then _KT_action). CPU falls back to the arch
+    # reference methods.
+    _orig_kt = getattr(model_cls, "_KT_action", None)
+    _orig_nlm_t = getattr(model_cls, "NLM_transpose", None)
+    _orig_lap_grw = getattr(model_cls, "laplacian_grw", None)
+
+    def _lazy_init(self):
+        if not hasattr(self, "_cached_shift_tensor"):
+            self.use_cuda_shift = True
+            self._cached_shift_tensor = None
+            self._cached_shift_device = None
+
+    def patched_kt_action(self, y, guide=None, sig=None):
+        _lazy_init(self)
+        if getattr(self, "use_cuda_shift", True) and y.is_cuda:
+            return _kt_action_cuda(self, y, guide=guide, sig=sig)
+        if _orig_kt is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no reference _KT_action; add the "
+                "arch-level _KT_action/NLM_transpose before installing.")
+        return _orig_kt(self, y, guide=guide, sig=sig)
+
+    def patched_nlm_transpose(self, x, guide=None, sig=None, return_D=False):
+        _lazy_init(self)
+        if getattr(self, "use_cuda_shift", True) and x.is_cuda:
+            return _nlm_transpose_cuda(self, x, guide=guide, sig=sig,
+                                       return_D=return_D)
+        if _orig_nlm_t is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no reference NLM_transpose; add "
+                "the arch-level methods before installing.")
+        return _orig_nlm_t(self, x, guide=guide, sig=sig, return_D=return_D)
+
+    def patched_laplacian_grw(self, x, guide, sig=None, eps=1e-10):
+        _lazy_init(self)
+        if getattr(self, "use_cuda_shift", True) and x.is_cuda:
+            return _laplacian_grw_cuda(self, x, guide, sig=sig, eps=eps)
+        if _orig_lap_grw is None:
+            raise AttributeError(
+                f"{type(self).__name__} has no reference laplacian_grw.")
+        return _orig_lap_grw(self, x, guide, sig=sig, eps=eps)
+
+    model_cls._KT_action = patched_kt_action
+    model_cls.NLM_transpose = patched_nlm_transpose
+    model_cls.laplacian_grw = patched_laplacian_grw
+
     model_cls._cuda_shift_installed = True
     return model_cls
