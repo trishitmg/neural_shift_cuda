@@ -75,8 +75,8 @@ else:
 
 setup(
     name="neural_shift_cuda",
-    version="0.10.7",
-    description="CUDA shift-gather / pair-gather / accumulate (per-pixel and scalar-per-transform) ops for NeKDe / GASD / GADSD denoisers.",
+    version="0.10.75",
+    description="CUDA shift-gather / pair-gather / accumulate (per-pixel and scalar-per-transform) ops for NeKDe / NeKDe-Mp / GASD / GADSD denoisers.",
     # picks up neural_shift_cuda/ and neural_shift_cuda/integration/
     packages=find_packages(),
     # ship the kernel sources inside the wheel/sdist so a non-editable
@@ -109,10 +109,7 @@ setup(
     # pinned CUDA build (e.g. 2.5.1+cu124) with a mismatched one. Omitting torch
     # lets you drop the --no-deps guard:
     #   pip install --no-build-isolation --force-reinstall "git+...".
-    # einops is only needed by the legacy nekre_patch, so it is an extra, not a
-    # core requirement (the GASD / NeKDe paths import only torch).
     install_requires=[],
-    extras_require={"nekre": ["einops>=0.6"]},
     python_requires=">=3.8",
     zip_safe=False,
 )

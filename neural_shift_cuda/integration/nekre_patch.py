@@ -30,7 +30,6 @@ Numerical tolerance vs the old path is ~1e-5 in fp32, exact in fp64.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 from neural_shift_cuda import shift_gather, pair_gather, accumulate_uz
 
@@ -89,9 +88,12 @@ def compute_weights_from_pair(self, pair_batch):
     for proj in self.proj:
         for i, sub_layer in enumerate(proj):
             if i == 1:  # LayerNorm layer
-                x = rearrange(x, 'b c h w -> b h w c')
+                # (b c h w) -> (b h w c): pure axis permutation, matches
+                # the original einops rearrange (non-contiguous view).
+                x = x.permute(0, 2, 3, 1)
                 x = sub_layer(x)
-                x = rearrange(x, 'b h w c -> b c h w')
+                # (b h w c) -> (b c h w)
+                x = x.permute(0, 3, 1, 2)
             else:
                 x = sub_layer(x)
 
