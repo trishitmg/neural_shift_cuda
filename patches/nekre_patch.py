@@ -8,7 +8,7 @@ class.
 
 What this changes
 -----------------
-1. Add two flags + a cached int32 shift tensor.
+1. Add two flags + a cached int64 shift tensor.
 2. Add `_get_shift_tensor(device)` helper.
 3. Add `compute_weights_from_pair(pair_batch)` — same body as
    `compute_weights` but skips the leading `torch.cat`, because
@@ -31,7 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from neural_shift_cuda import shift_gather, pair_gather, accumulate_uz
+from neural_shift_cuda import (
+    shift_gather, pair_gather, normalized_accumulate_uz,
+)
 
 
 # ----------------------------------------------------------------------
@@ -57,7 +59,7 @@ def _init_cuda_shift_flags(self):
 
 
 def _get_shift_tensor(self, device):
-    """Return shifts as an int32 tensor of shape (S, 3) on `device`.
+    """Return shifts as an int64 tensor of shape (S, 3) on `device`.
 
     Layout matches `_collect_shifts()`:
       [ (dx, dy, has_inverse), ... ]   with S = 2*R*R + 2*R + 1.
@@ -69,7 +71,7 @@ def _get_shift_tensor(self, device):
         shifts_int = [(int(dx), int(dy), int(bool(hi)))
                       for (dx, dy, hi) in shifts]
         self._cached_shift_tensor = torch.tensor(
-            shifts_int, dtype=torch.int32, device=device)
+            shifts_int, dtype=torch.int64, device=device)
         self._cached_shift_device = device
     return self._cached_shift_tensor
 
@@ -139,7 +141,7 @@ def _forward_batched_cuda(self, x, guide=None, sig=None):
     S = 2 * R * R + 2 * R + 1
     Cg = guide.shape[1]
 
-    shifts = self._get_shift_tensor(device=x.device)  # (S, 3) int32
+    shifts = self._get_shift_tensor(device=x.device)  # (S, 3) int64
 
     # --- Phase 1/2: shift gather + weight computation ---
     if self.model_type == 'concat' and self.use_cuda_pair_gather:
@@ -161,8 +163,10 @@ def _forward_batched_cuda(self, x, guide=None, sig=None):
     weights = weights * mask_batch
 
     # --- Phase 3: U/Z accumulation with forward + inverse symmetry ---
-    U_num, Z = accumulate_uz(x_c, weights.contiguous(), shifts)
-    U = U_num / Z
+    U, log_Z = normalized_accumulate_uz(
+        x_c, weights.contiguous(), shifts,
+        return_log_degree=True, validate=False)
+    Z = log_Z.exp()
     return U, Z
 
 

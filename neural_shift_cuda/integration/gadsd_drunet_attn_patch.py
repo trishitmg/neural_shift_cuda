@@ -123,15 +123,15 @@ def _gadsd_transform_partition(self):
 
 
 def _gadsd_trans_shifts(self, trans_meta, device: torch.device) -> torch.Tensor:
-    """Cache the (St, 2) int32 NEGATED shift tensor (gather convention) on
+    """Cache the (St, 2) int64 NEGATED shift tensor (gather convention) on
     ``device`` -- see the 'Shift convention' note in the module docstring."""
     cache = getattr(self, "_gadsd_shift_cache", None)
     if (cache is not None and cache[0] == id(self.transforms)
             and cache[1] == device):
         return cache[2]
     rows = [(-dx, -dy) for (_, dx, dy) in trans_meta]
-    shifts = (torch.tensor(rows, dtype=torch.int32, device=device)
-              if rows else torch.empty(0, 2, dtype=torch.int32, device=device))
+    shifts = (torch.tensor(rows, dtype=torch.int64, device=device)
+              if rows else torch.empty(0, 2, dtype=torch.int64, device=device))
     self._gadsd_shift_cache = (id(self.transforms), device, shifts)
     return shifts
 
@@ -178,7 +178,7 @@ def _forward_cuda(
 
     # Translation shift tensor + count are consumed by the accumulation below in
     # both the delegated and legacy paths, so resolve them up-front.
-    trans_shifts = _gadsd_trans_shifts(self, trans_meta, x.device)   # (St, 2) int32
+    trans_shifts = _gadsd_trans_shifts(self, trans_meta, x.device)   # (St, 2) int64
     St = trans_shifts.size(0)
 
     if hasattr(self, "_transform_weights_gather"):

@@ -34,7 +34,11 @@ from .ops import accumulate_uz, shift_gather
 
 try:  # compiled extension (built from csrc/metropolis_cuda.cu + metropolis.cpp)
     from . import _C as _ext  # type: ignore
-    _HAS_EXT = hasattr(_ext, "metropolis_aggregate")
+    _HAS_EXT = (
+        hasattr(_ext, "metropolis_aggregate")
+        and hasattr(_ext, "index_width_bits")
+        and int(_ext.index_width_bits()) == 64
+    )
 except Exception:  # pragma: no cover - extension optional
     _ext = None
     _HAS_EXT = False

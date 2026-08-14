@@ -23,7 +23,9 @@ import statistics as stats
 import torch
 import torch.nn.functional as F
 
-from neural_shift_cuda import shift_gather, pair_gather, accumulate_uz
+from neural_shift_cuda import (
+    shift_gather, pair_gather, normalized_accumulate_uz,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +218,10 @@ def run_model_bench(B, C_img, H, W, R):
             pair_batch, mask = pair_gather(guide.contiguous(), shifts)
             weights = model.compute_weights_from_pair(pair_batch)
             weights = weights * mask
-            U_num, Z = accumulate_uz(x.contiguous(), weights.contiguous(), shifts)
-            return U_num / Z, Z
+            U, log_Z = normalized_accumulate_uz(
+                x.contiguous(), weights.contiguous(), shifts,
+                return_log_degree=True, validate=False)
+            return U, log_Z.exp()
 
     print(f"\n[model] B={B} C_img={C_img} H={H} W={W} R={R}")
     old_t = bench(f_old, warmup=3, iters=10)

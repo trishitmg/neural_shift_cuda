@@ -122,15 +122,15 @@ def _moments_partition(self):
 
 
 def _moments_trans_shifts(self, trans_meta, device: torch.device) -> torch.Tensor:
-    """Cache the (St, 2) int32 NEGATED shift tensor (gather convention) on
+    """Cache the (St, 2) int64 NEGATED shift tensor (gather convention) on
     ``device`` -- see the 'Shift convention' note in the module docstring."""
     cache = getattr(self, "_gadsdm_shift_cache", None)
     if (cache is not None and cache[0] == id(self.transforms)
             and cache[1] == device):
         return cache[2]
     rows = [(-dx, -dy) for (_, dx, dy) in trans_meta]
-    shifts = (torch.tensor(rows, dtype=torch.int32, device=device)
-              if rows else torch.empty(0, 2, dtype=torch.int32, device=device))
+    shifts = (torch.tensor(rows, dtype=torch.int64, device=device)
+              if rows else torch.empty(0, 2, dtype=torch.int64, device=device))
     self._gadsdm_shift_cache = (id(self.transforms), device, shifts)
     return shifts
 
@@ -151,7 +151,7 @@ def _gather_chunk_stack(self, phi: torch.Tensor, start: int, end: int) -> torch.
 
     if all(is_shift):
         rows = [(-int(g.dx), -int(g.dy)) for g in members]
-        shifts = torch.tensor(rows, dtype=torch.int32, device=phi.device)
+        shifts = torch.tensor(rows, dtype=torch.int64, device=phi.device)
         gathered, _ = shift_gather(phi, shifts)          # (n*B, F, H, W)
         B = phi.shape[0]
         return gathered.view(n, B, *phi.shape[1:]).transpose(0, 1)
@@ -163,7 +163,7 @@ def _gather_chunk_stack(self, phi: torch.Tensor, start: int, end: int) -> torch.
     # reassembled in original order (positions must line up with descriptors).
     B = phi.shape[0]
     rows = [(-int(g.dx), -int(g.dy)) for g, s in zip(members, is_shift) if s]
-    shifts = torch.tensor(rows, dtype=torch.int32, device=phi.device)
+    shifts = torch.tensor(rows, dtype=torch.int64, device=phi.device)
     gathered, _ = shift_gather(phi, shifts)
     gathered = gathered.view(len(rows), B, *phi.shape[1:])
     tiles: List[torch.Tensor] = []

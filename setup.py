@@ -75,8 +75,8 @@ else:
 
 setup(
     name="neural_shift_cuda",
-    version="0.10.75",
-    description="CUDA shift-gather / pair-gather / accumulate (per-pixel and scalar-per-transform) ops for NeKDe / NeKDe-Mp / GASD / GADSD denoisers.",
+    version="0.11.1",
+    description="CUDA shift-gather and promoted-precision parallel tree reductions, including overflow-safe normalized aggregation, for NeKDe / GASD denoisers.",
     # picks up neural_shift_cuda/ and neural_shift_cuda/integration/
     packages=find_packages(),
     # ship the kernel sources inside the wheel/sdist so a non-editable
