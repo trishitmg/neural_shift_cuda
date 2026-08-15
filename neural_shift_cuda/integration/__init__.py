@@ -81,6 +81,7 @@ from .nkd_mp_moments_patch import install_cuda_shift as install_cuda_shift_metro
 
 # Other model families
 from .nekre_patch import install_cuda_shift as install_cuda_shift_nekre
+from .nectr_patch import install_cuda_shift as install_cuda_shift_nectr
 from .nkd_metropolis_attn_patch import install_cuda_shift as install_cuda_shift_metropolis
 
 __all__ = [
@@ -92,5 +93,6 @@ __all__ = [
     "install_cuda_shift_gasd_moments",
     "install_cuda_shift_metropolis_moments",
     "install_cuda_shift_nekre",
+    "install_cuda_shift_nectr",
     "install_cuda_shift_metropolis",
 ]
