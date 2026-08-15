@@ -81,17 +81,14 @@ denoisers plus the original model:
 - **NKD_mp attn** — Metropolis normalization; the inverse edge is formed by a
   circular shift of the *post-activation* forward weight inside the op, so `W` is
   exactly symmetric and nonexpansive regardless of the output activation.
-- **NECTR (original)** — the original model from the paper (`nekre` class). Only
-  the `batched=True` branch of `forward` is patched; the non-batched path is
-  untouched. `pair_gather` fuses the center/shifted concatenation, then
+- **NECTR (original)** — the original model from the paper (`nekre` class). 
+  `pair_gather` fuses the center/shifted concatenation, then
   `accumulate_uz` does the forward + inverse-symmetric U/Z accumulation with the
   same box validity mask as the reference. Two lazy-init flags gate it:
   `use_cuda_shift` (whole CUDA path) and `use_cuda_pair_gather` (the fused
-  gather). Tolerance vs the reference is ~1e-5 in fp32, exact in fp64. This is
-  the only arch that needs the `einops` extra (see Install).
+  gather). Tolerance vs the reference is ~1e-5 in fp32, exact in fp64. 
 
-Patches for further archs (GADSD, moments-branch) exist internally and will be
-listed here as they are released.
+Patches for further archs (GADSD, moments-branch) exist internally and will be listed here as they are released.
 
 ## Requirements
 
@@ -111,14 +108,6 @@ The extension compiles **on the installing machine** (no prebuilt wheel), so
 ```bash
 pip install --no-build-isolation --force-reinstall -v \
     "git+https://github.com/007Trishit/neural_shift_cuda.git@main"
-```
-
-The NECTR (`nekre`) patch additionally imports `einops`; install the extra if
-you use it:
-
-```bash
-pip install --no-build-isolation --force-reinstall -v \
-    "git+https://github.com/007Trishit/neural_shift_cuda.git@main#egg=neural_shift_cuda[nekre]"
 ```
 
 Editable clone (while iterating on kernels):
@@ -216,7 +205,7 @@ median wall-clock time of each path and their ratio (serial ÷ parallel). Higher
 speed-up is better; the **full step (fwd+bwd)** row is what training
 iterations/second track.
 
-### NeKDe attn
+### NeKDe-Attn
 | Stage | Serial (ms) | Parallel (ms) | Speed-up |
 |---|--:|--:|--:|
 | Forward (inference) | 19.17 | 12.45 | 1.54× |
@@ -224,7 +213,7 @@ iterations/second track.
 | Backward | 116.22 | 50.72 | 2.29× |
 | **Full step (fwd+bwd)** | **140.37** | **63.03** | **2.23×** |
 
-### GASD attn
+### GASD-Attn
 | Stage | Serial (ms) | Parallel (ms) | Speed-up |
 |---|--:|--:|--:|
 | Forward (inference) | 22.33 | 21.09 | 1.06× |
@@ -232,7 +221,7 @@ iterations/second track.
 | Backward | 151.45 | 113.83 | 1.33× |
 | **Full step (fwd+bwd)** | **177.02** | **134.81** | **1.31×** |
 
-### NKD_mp attn
+### METRO-NeKDe-Attn
 | Stage | Serial (ms) | Parallel (ms) | Speed-up |
 |---|--:|--:|--:|
 | Forward (inference) | 34.32 | 12.73 | 2.70× |
@@ -240,13 +229,21 @@ iterations/second track.
 | Backward | 148.99 | 75.61 | 1.97× |
 | **Full step (fwd+bwd)** | **192.92** | **91.02** | **2.12×** |
 
-### NECTR (original)
+### NECTR1 (original)
 | Stage | Serial (ms) | Parallel (ms) | Speed-up |
 |---|--:|--:|--:|
-| Forward (inference) | 91.00 | 82.92 | 1.10× |
-| Forward (train) | 91.19 | 82.91 | 1.10× |
-| Backward | 226.17 | 167.65 | 1.35× |
-| **Full step (fwd+bwd)** | **317.36** | **250.56** | **1.27×** |
+| Forward (inference) | 56.62 | 47.70 | 1.19× |
+| Forward (train) | 57.65 | 48.55 | 1.19× |
+| Backward | 125.13 | 64.85 | 1.93× |
+| **Full step (fwd+bwd)** | **182.79** | **113.34** | **1.61×** |
+
+### NECTR2 (original)
+| Stage | Serial (ms) | Parallel (ms) | Speed-up |
+|---|--:|--:|--:|
+| Forward (inference) | 164.32 | 135.88 | 1.21× |
+| Forward (train) | 171.81 | 137.10 | 1.25× |
+| Backward | 329.22 | 239.44 | 1.38× |
+| **Full step (fwd+bwd)** | **501.04** | **376.43** | **1.33×** |
 
 Reproduce with `python tests/benchmark_archs.py --config tests/configs/<arch>.yaml`.
 
