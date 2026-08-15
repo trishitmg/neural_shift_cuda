@@ -71,7 +71,7 @@ denoisers plus the original model:
 | NeKDe attn | `NeKDeDRUNetAttn` (`NKD_drunet_attn_v2.py`, v2/v3/v4) | `install_cuda_shift_attn` | `accumulate_uz` | _to be updated soon_ |
 | GASD attn | `GASDDRUNetAttn` (`GASD_drunet_attn_v2.py`) | `install_cuda_shift_gasd` | `accumulate_uz` | _to be updated soon_ |
 | NKD_mp attn | `NeKDeMetropolisDRUNetAttn` (`NKD_mp_drunet_attn_v2.py`) | `install_cuda_shift_metropolis` | `metropolis_aggregate` | _to be updated soon_ |
-| NECTR (original) | `nekre` (`NKD_models_symm.py`) | `install_cuda_shift_nekre` | `shift_gather`, `pair_gather`, `accumulate_uz` | [![arXiv](https://img.shields.io/badge/arXiv-2607.23347-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2607.23347) [![Code](https://img.shields.io/badge/Code-181717?logo=github&logoColor=white)](https://github.com/arghyasinha/nectr) |
+| NECTR (original) | `NECTR_denoiser` (`NECTR_models{1,2}.py`) | `install_cuda_shift_nectr` | `shift_gather`, `pair_gather`, `accumulate_uz` | [![arXiv](https://img.shields.io/badge/arXiv-2607.23347-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2607.23347) [![Code](https://img.shields.io/badge/Code-181717?logo=github&logoColor=white)](https://github.com/arghyasinha/nectr) |
 
 - **NeKDe attn** — half-plane shifts, per-pixel weights, inverse-symmetry. The
   model's `comp_box` flag is read per-forward (True → finite-window mask; False →
@@ -187,10 +187,10 @@ from NKD_mp_drunet_attn_v2 import NeKDeMetropolisDRUNetAttn
 from neural_shift_cuda.integration import install_cuda_shift_metropolis
 install_cuda_shift_metropolis(NeKDeMetropolisDRUNetAttn)
 
-# NECTR (original model) — routes only the batched=True forward
-from NKD_models_symm import nekre
-from neural_shift_cuda.integration import install_cuda_shift_nekre
-install_cuda_shift_nekre(nekre)
+# NECTR (original icml paper model) 
+from NECTR_models{1,2} import NECTR_denoiser
+from neural_shift_cuda.integration import install_cuda_shift_nectre
+install_cuda_shift_nectr(NECTR_denoiser)
 ```
 
 Force the reference PyTorch path per instance: `model.use_cuda_shift = False`.
