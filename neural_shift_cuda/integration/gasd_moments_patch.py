@@ -58,7 +58,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from neural_shift_cuda import shift_gather, accumulate_uz
+from neural_shift_cuda import (
+    shift_gather, accumulate_uz, normalized_accumulate_uz,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +86,7 @@ def _normalise_sigma_patch(sig, reference: torch.Tensor):
 
 
 def _get_shift_tensor(self, device: torch.device) -> torch.Tensor:
-    """Cache the (S, 3) int32 shift tensor on `device`.
+    """Cache the (S, 3) int64 shift tensor on `device`.
 
     GASD's `_collect_shifts()` returns (dx, dy) pairs over the FULL (2R+1)^2
     window. We build the (S, 3) tensor with the inverse flag pinned to 0 on
@@ -96,7 +98,7 @@ def _get_shift_tensor(self, device: torch.device) -> torch.Tensor:
         shifts = self._collect_shifts()              # [(dx, dy), ...] full window
         rows = [(int(dx), int(dy), 0) for (dx, dy) in shifts]
         self._cached_shift_tensor = torch.tensor(
-            rows, dtype=torch.int32, device=device)
+            rows, dtype=torch.int64, device=device)
         self._cached_shift_device = device
     return self._cached_shift_tensor
 
@@ -170,7 +172,7 @@ def _forward_cuda(
     # ---- Shift tensor (full window, inverse flag = 0) + descriptors ----
     # Module-level call (not self._get_shift_tensor) so _forward_cuda also
     # works when invoked directly, before install_cuda_shift attached it.
-    shifts_t = _get_shift_tensor(self, x.device)                 # (S, 3) int32
+    shifts_t = _get_shift_tensor(self, x.device)                 # (S, 3) int64
     shifts_xy = shifts_t[:, :2].contiguous()                     # (S, 2)
     S = shifts_t.shape[0]
     chunk = self.max_batch_shifts if self.max_batch_shifts is not None else S
@@ -194,7 +196,7 @@ def _forward_cuda(
     for start in range(0, S, chunk):
         end = min(start + chunk, S)
         n = end - start
-        shifts_chunk = shifts_xy[start:end]                      # (n, 2) int32
+        shifts_chunk = shifts_xy[start:end]                      # (n, 2) int64
 
         phi_s_batch, mask_chunk = shift_gather(
             phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
@@ -253,9 +255,11 @@ def _forward_cuda(
         w_all = w_all * mask_all
     w_all = w_all.contiguous()
 
-    # ---- Single fused U/Z accumulation (forward only; inverse flag = 0) ----
-    U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
-    U = U_num / Z.clamp_min(1e-6)
+    # ---- Stable normalized tree reduction (forward only; inverse flag = 0) ----
+    U, log_Z = normalized_accumulate_uz(
+        x.contiguous(), w_all, shifts_t,
+        return_log_degree=True, validate=False)
+    Z = log_Z.exp() if return_D else None
 
     if not self.training:
         self.max_batch_shifts = None
@@ -276,12 +280,12 @@ def _forward_cuda(
 # ---------------------------------------------------------------------------
 
 def _get_kt_shift_tensor(self, device: torch.device) -> torch.Tensor:
-    """(S, 3) int32 with every (dx, dy) NEGATED and the inverse flag 0."""
+    """(S, 3) int64 with every (dx, dy) NEGATED and the inverse flag 0."""
     if (getattr(self, "_cached_kt_shift_tensor", None) is None
             or getattr(self, "_cached_kt_shift_device", None) != device):
         rows = [(-int(dx), -int(dy), 0) for (dx, dy) in self._collect_shifts()]
         self._cached_kt_shift_tensor = torch.tensor(
-            rows, dtype=torch.int32, device=device)
+            rows, dtype=torch.int64, device=device)
         self._cached_kt_shift_device = device
     return self._cached_kt_shift_tensor
 

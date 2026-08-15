@@ -32,12 +32,28 @@ all shifts together:
   and slicing `S` times.
 - **Score once.** The weight network then runs a single time on the whole stack
   of shifts rather than `S` times.
-- **Accumulate once, using symmetry.** `accumulate_uz` (or `metropolis_aggregate`
-  for the Metropolis variant) sums each shift's weighted contribution into `U`
-  and `Z` in one fused kernel. Because the kernel is symmetric — a shift and its
-  mirror share the same weight — only about half the shifts need a network
-  evaluation; the mirror contribution is recovered by an inverse shift *inside*
-  the kernel.
+- **Accumulate with a parallel tree.** `accumulate_uz` assigns one CUDA lane to
+  each shift and reduces the per-shift `(weight * shifted_x, weight)` pairs in a
+  shared-memory binary tree. The shift-axis dependency depth is `O(log S)`, not
+  the old `O(S)` loop inside each output thread. This is the additive analogue
+  of the batched associative scan used by Boissin et al. for AOC. Because a
+  shift and its mirror share the same weight, the mirror contribution is formed
+  inside the owning lane and participates in the same tree.
+- **Promote before reducing.** fp16, bfloat16, and fp32 inputs are converted to
+  fp32 *before* the first multiply/add; fp64 stays fp64. `U` and `Z` remain in
+  the accumulator dtype instead of being narrowed back to fp16.
+- **Use 64-bit index arithmetic.** Shift tensors, tensor extents, flattened
+  offsets, and grid-stride products are `int64` end-to-end. The CUDA grid size
+  remains a bounded `int`, while each kernel grid-strides across the full
+  64-bit element count. This prevents wraparound once a flattened workload
+  exceeds the signed-int32 limit (`2^31 - 1`). Version 0.11.1 also rejects a
+  stale compiled extension that advertises the earlier 32-bit indexing ABI.
+- **Normalize without forming an overflowing degree.** The optional
+  `normalized_accumulate_uz` path performs a max reduction followed by a
+  max-shifted sum reduction and directly returns `D=K/C`. It can consume either
+  finite positive weights or log-weights/logits. The latter is an online-
+  softmax/Flash-Attention-style computation and prevents overflow even before
+  an exponential positive activation would have been evaluated.
 
 The net effect is a handful of large, GPU-friendly kernel launches instead of
 hundreds of small serialized ones, so the GPU stays busy. The math is unchanged
@@ -116,8 +132,51 @@ pip install --no-build-isolation -v -e .
 Verify:
 
 ```bash
-python -c "from neural_shift_cuda import accumulate_uz, metropolis_aggregate; print('ok')"
+python -c "from neural_shift_cuda import accumulate_uz, normalized_accumulate_uz; print('ok')"
 ```
+
+## Parallel, overflow-safe normalized aggregation
+
+For already-materialized nonnegative weights, zero denotes a masked edge:
+
+```python
+from neural_shift_cuda import normalized_accumulate_uz
+
+# x: (B,C,H,W), weights: (S*B,C,H,W), shifts: (S,3)
+# Integer shifts are normalized to torch.int64 before CUDA dispatch.
+D, log_C = normalized_accumulate_uz(
+    x, weights, shifts, return_log_degree=True
+)
+```
+
+The ratio is invariant to the row maximum, so the implementation computes
+
+```text
+m     = max_s log(w_s)
+a_s   = exp(log(w_s) - m)        # 0 <= a_s <= 1
+D     = sum_s a_s * shift_s(x) / sum_s a_s
+log_C = m + log(sum_s a_s)
+```
+
+`log_C` is returned instead of `C` because `C` may genuinely lie outside the
+chosen floating-point type even though the normalized image is finite.
+
+If the positive activation is exponential (or can itself overflow), do not
+form `exp(logits)` first. Pass the logits directly and encode masked entries as
+`-inf`:
+
+```python
+masked_logits = logits.masked_fill(~valid_edge_mask, -torch.inf)
+D = normalized_accumulate_uz(
+    x, masked_logits, shifts, log_weights=True
+)
+```
+
+The operation is fully differentiable with respect to `x` and to either the
+positive weights or log-weights. Invalid positive weights (negative, NaN, inf)
+and invalid log-weights (NaN, +inf) are rejected by default. Set
+`validate=False` only when the producing network already enforces this contract
+and the extra validation reduction is measurable.
 
 ## Use
 
@@ -195,5 +254,13 @@ Reproduce with `python tests/benchmark_archs.py --config tests/configs/<arch>.ya
 
 ```bash
 pytest -q tests/test_shift_gather.py tests/test_accumulate_uz.py
+pytest -q tests/test_normalized_accumulate_uz.py
+pytest -q tests/test_index_width.py
 pytest -q tests/test_attn_forward_equivalence.py
+```
+
+Benchmark the serial shift loop, exact tree, and stable tree on the target GPU:
+
+```bash
+python tests/benchmark_parallel_reduction.py --B 4 --H 128 --W 128 --R 5
 ```

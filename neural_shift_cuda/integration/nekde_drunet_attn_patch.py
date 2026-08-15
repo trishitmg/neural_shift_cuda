@@ -78,7 +78,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from neural_shift_cuda import shift_gather, accumulate_uz
+from neural_shift_cuda import (
+    shift_gather, accumulate_uz, normalized_accumulate_uz,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -86,14 +88,14 @@ from neural_shift_cuda import shift_gather, accumulate_uz
 # ---------------------------------------------------------------------------
 
 def _get_shift_tensor(self, device: torch.device) -> torch.Tensor:
-    """Cache the (S, 3) int32 shift tensor on `device`."""
+    """Cache the (S, 3) int64 shift tensor on `device`."""
     if (getattr(self, "_cached_shift_tensor", None) is None
             or self._cached_shift_device != device):
         # [(dx, dy, has_inverse), ...]
         shifts = self._collect_shifts()
         rows = [(int(dx), int(dy), int(bool(hi))) for (dx, dy, hi) in shifts]
         self._cached_shift_tensor = torch.tensor(
-            rows, dtype=torch.int32, device=device)
+            rows, dtype=torch.int64, device=device)
         self._cached_shift_device = device
     return self._cached_shift_tensor
 
@@ -175,7 +177,7 @@ def _forward_cuda(
     phi = self.pre_activation(g_input, sigma=sig).contiguous()   # (B, F, H, W)
 
     # ---- Shift tensor ----
-    shifts_t = self._get_shift_tensor(x.device)                  # (S, 3) int32
+    shifts_t = self._get_shift_tensor(x.device)                  # (S, 3) int64
     shifts_xy = shifts_t[:, :2].contiguous()                     # (S, 2)
     S = shifts_t.shape[0]
     chunk = self.max_batch_shifts if self.max_batch_shifts is not None else S
@@ -244,7 +246,7 @@ def _forward_cuda(
                  for (dx, dy, _) in shift_list], dim=0)   # (S, 1, 1, H, W)
             w_all = (w_stack * mask_stack).reshape(
                 S * B, C, H, W).contiguous()
-            U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
+            reduction_shifts = shifts_t
         else:
             # Fully periodic: same explicit-inverse enumeration as the
             # legacy branch (has_inverse=0 rows; kernel does forward-only
@@ -264,10 +266,13 @@ def _forward_cuda(
             w_all = torch.stack(entries, dim=0).reshape(
                 M * B, C, H, W).contiguous()
             shifts_periodic = torch.tensor(
-                rows, dtype=torch.int32, device=x.device)
-            U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_periodic)
+                rows, dtype=torch.int64, device=x.device)
+            reduction_shifts = shifts_periodic
 
-        U = U_num / Z.clamp_min(1e-6)
+        U, log_Z = normalized_accumulate_uz(
+            x.contiguous(), w_all, reduction_shifts,
+            return_log_degree=True, validate=False)
+        Z = log_Z.exp() if return_D else None
         if not self.training:
             self.max_batch_shifts = None
         if return_D:
@@ -296,7 +301,7 @@ def _forward_cuda(
     for start in range(0, S, chunk):
         end = min(start + chunk, S)
         n = end - start
-        shifts_chunk = shifts_xy[start:end]                      # (n, 2) int32
+        shifts_chunk = shifts_xy[start:end]                      # (n, 2) int64
 
         phi_s_batch, mask_chunk = shift_gather(
             phi, shifts_chunk)  # (n*B, F, H, W), (n*B, 1, H, W)
@@ -350,7 +355,7 @@ def _forward_cuda(
         w_all = w_stack.view(S * B, C, H, W)
         mask_all = torch.cat(mask_tiles, dim=0)                  # (S*B, 1, H, W)
         w_all = (w_all * mask_all).contiguous()
-        U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_t)
+        reduction_shifts = shifts_t
     else:
         # ---- comp_box=False: fully periodic. Enumerate each shift AND its
         #      explicit inverse (-dx,-dy), both has_inverse=0, feeding the
@@ -373,10 +378,13 @@ def _forward_cuda(
         M = len(entries)
         w_all = torch.stack(entries, dim=0).reshape(M * B, C, H, W).contiguous()
         shifts_periodic = torch.tensor(
-            rows, dtype=torch.int32, device=x.device)
-        U_num, Z = accumulate_uz(x.contiguous(), w_all, shifts_periodic)
+            rows, dtype=torch.int64, device=x.device)
+        reduction_shifts = shifts_periodic
 
-    U = U_num / Z.clamp_min(1e-6)
+    U, log_Z = normalized_accumulate_uz(
+        x.contiguous(), w_all, reduction_shifts,
+        return_log_degree=True, validate=False)
+    Z = log_Z.exp() if return_D else None
 
     if not self.training:
         self.max_batch_shifts = None
@@ -452,7 +460,7 @@ def _kt_action_cuda(self, y, guide=None, sig=None,
         M = len(entries)
         w_all = torch.stack(entries, dim=0).reshape(
             M * B, C, H, W).contiguous()
-        shifts_used = torch.tensor(rows, dtype=torch.int32, device=y.device)
+        shifts_used = torch.tensor(rows, dtype=torch.int64, device=y.device)
 
     # First launch: (K y, Z = D). D never needs a network pass of its own.
     U, Z = accumulate_uz(y.contiguous(), w_all, shifts_used)
