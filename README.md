@@ -195,6 +195,26 @@ install_cuda_shift_nectr(NECTR_denoiser)
 
 Force the reference PyTorch path per instance: `model.use_cuda_shift = False`.
 
+### Fixed-guide weight caches
+
+The same three installers now also accelerate the cache APIs in the supplied
+attention models. No call-site change is required:
+
+```python
+cache = model.build_weight_cache(guide, sig=sigma)
+Wx, D = model.forward_cached(x, cache, return_D=True)
+```
+
+For NeKDe and Metropolis, `forward_cached` packs the cached half-plane weights
+once and applies the symmetric shift-and-sum with one fused parallel reduction
+per call. For GASD, both `forward_cached` and `_KT_action_cached` are patched;
+therefore `laplacian_grw_cached` uses parallel cached `Kx` and `K.T @ x`
+actions. The packed tensors and device shift tables are retained on the model
+and reused for every subsequent CG matvec with that cache. Passing a different
+cache replaces the packed state. CPU inputs, older model files without cache
+methods, and instances with `use_cuda_shift = False` keep their original serial
+implementations.
+
 ## Benchmarks
 
 Serial (reference PyTorch per-shift loop) vs parallel (`neural_shift_cuda`) on
@@ -254,6 +274,7 @@ pytest -q tests/test_shift_gather.py tests/test_accumulate_uz.py
 pytest -q tests/test_normalized_accumulate_uz.py
 pytest -q tests/test_index_width.py
 pytest -q tests/test_attn_forward_equivalence.py
+pytest -q tests/test_cached_forward_patches.py
 ```
 
 Benchmark the serial shift loop, exact tree, and stable tree on the target GPU:

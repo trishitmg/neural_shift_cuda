@@ -141,6 +141,102 @@ def _mix_heads_vec(
 
 
 # ---------------------------------------------------------------------------
+# Fixed-guide cached forward (NEW).
+#
+# ``KernelWeightCache`` already stores the final, head-mixed forward edge for
+# every canonical half-plane shift.  The architecture's ``forward_cached``
+# still walks those edges in Python, however.  Pack the immutable cache once
+# and feed it to the same tree-reduction kernel as the non-cached CUDA forward.
+# Subsequent CG matvecs reuse both the packed weights and the device shift
+# tensor, so each cached forward is one fused reduction launch.
+# ---------------------------------------------------------------------------
+
+def _cached_reduction_inputs(self, x: torch.Tensor, cache):
+    """Return packed cached weights and shifts for ``accumulate_uz``.
+
+    The packed representation is retained on the model and keyed by the cache
+    object itself.  Holding the cache object (rather than only ``id(cache)``)
+    prevents accidental key reuse and bounds storage to the most recently used
+    fixed guide.
+    """
+    if x.dim() != 4:
+        raise ValueError(f"x must have shape (B,C,H,W), got {tuple(x.shape)}.")
+    if x.size(1) != cache.C:
+        raise ValueError(
+            f"cached weights have C={cache.C} channels but x has "
+            f"{x.size(1)}; rebuild the cache for this channel count.")
+
+    state = getattr(self, "_nekde_parallel_weight_cache", None)
+    shape_key = tuple(x.shape)
+    if (state is not None and state[0] is cache and state[1] == shape_key
+            and state[2] == x.device and state[3] == x.dtype):
+        return state[4], state[5]
+
+    shifts = list(cache.shifts)
+    weights = list(cache.w_fwd_list)
+    if len(weights) != len(shifts) or not weights:
+        raise ValueError(
+            "cached w_fwd_list must contain one tensor per cached shift.")
+    for weight in weights:
+        if tuple(weight.shape) != shape_key:
+            raise ValueError(
+                "cached weights and x must have identical (B,C,H,W) shapes; "
+                f"got {tuple(weight.shape)} and {shape_key}.")
+        if weight.device != x.device or weight.dtype != x.dtype:
+            raise ValueError("cached weights and x must share device and dtype.")
+
+    w_stack = torch.stack(weights, dim=0)  # (S,B,C,H,W), packed once per guide
+    if bool(cache.comp_box):
+        rows = [(int(dx), int(dy), int(bool(has_inv)))
+                for dx, dy, has_inv in shifts]
+        w_all = w_stack.reshape(-1, *x.shape[1:]).contiguous()
+    else:
+        # The periodic operator cannot use accumulate_uz's masked inverse
+        # branch.  Materialise the shifted twin once in the packed cache and
+        # submit both directions as forward-only rows.
+        entries: List[torch.Tensor] = []
+        rows: List[Tuple[int, int, int]] = []
+        for i, (dx, dy, has_inv) in enumerate(shifts):
+            w_fwd = w_stack[i]
+            entries.append(w_fwd)
+            rows.append((int(dx), int(dy), 0))
+            if has_inv:
+                entries.append(torch.roll(
+                    w_fwd, shifts=(int(dx), int(dy)), dims=(-2, -1)))
+                rows.append((-int(dx), -int(dy), 0))
+        w_all = torch.stack(entries, dim=0).reshape(
+            -1, *x.shape[1:]).contiguous()
+
+    shifts_t = torch.tensor(rows, dtype=torch.int64, device=x.device)
+    self._nekde_parallel_weight_cache = (
+        cache, shape_key, x.device, x.dtype, w_all, shifts_t)
+    return w_all, shifts_t
+
+
+def _forward_cached_cuda(
+    self,
+    x: torch.Tensor,
+    cache,
+    return_D: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Overflow-safe parallel ``forward_cached`` using one fused launch.
+
+    No guide features or attention weights are recomputed.  ``cache.D`` is
+    reused when present; while a cache is being built, the degree returned by
+    the normalized reduction initializes it.  Unlike raw ``accumulate_uz``,
+    this never has to materialize a potentially overflowing unnormalized Kx.
+    """
+    w_all, shifts_t = _cached_reduction_inputs(self, x, cache)
+    Wx, log_degree = normalized_accumulate_uz(
+        x.contiguous(), w_all, shifts_t,
+        return_log_degree=True, validate=False)
+    degree = (
+        cache.D if getattr(cache, "D", None) is not None
+        else log_degree.exp())
+    return (Wx, degree) if return_D else (Wx, None)
+
+
+# ---------------------------------------------------------------------------
 # Forward replacement
 # ---------------------------------------------------------------------------
 
@@ -393,8 +489,6 @@ def _forward_cuda(
         return U, Z
     return U, None
 
-
-
 # ---------------------------------------------------------------------------
 # K^T action (NEW). K = K^T for NeKDe (half-plane + circular-shift twin), so
 # K^T y is the SAME symmetric accumulation the forward uses -- NO new kernel
@@ -491,6 +585,7 @@ def install_cuda_shift(model_cls):
 
     model_cls._get_shift_tensor = _get_shift_tensor
     original_forward = model_cls.forward
+    original_forward_cached = getattr(model_cls, "forward_cached", None)
 
     # Derive return_D's default from the wrapped forward so the patched
     # signature stays in lockstep with the model (v2/v3/v4) instead of
@@ -518,6 +613,29 @@ def install_cuda_shift(model_cls):
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward
+
+    # Fixed-guide cache wiring is optional so the patch remains compatible
+    # with older architecture files that predate KernelWeightCache.
+    if original_forward_cached is not None:
+        _cached_sig = inspect.signature(original_forward_cached)
+        _cached_has_return_D = "return_D" in _cached_sig.parameters
+        _cached_return_D_default = (
+            _cached_sig.parameters["return_D"].default
+            if _cached_has_return_D else True)
+
+        def patched_forward_cached(
+                self, x, cache, return_D=_cached_return_D_default):
+            if not hasattr(self, "use_cuda_shift"):
+                self.use_cuda_shift = True
+            if getattr(self, "use_cuda_shift", True) and x.is_cuda:
+                return _forward_cached_cuda(
+                    self, x, cache, return_D=return_D)
+            if _cached_has_return_D:
+                return original_forward_cached(
+                    self, x, cache, return_D=return_D)
+            return original_forward_cached(self, x, cache)
+
+        model_cls.forward_cached = patched_forward_cached
 
     # ---- K^T wiring (arch-level _KT_action / NLM_transpose route here) ----
     _orig_kt = getattr(model_cls, "_KT_action", None)

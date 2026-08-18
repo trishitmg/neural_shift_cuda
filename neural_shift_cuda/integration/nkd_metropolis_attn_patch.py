@@ -37,6 +37,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from neural_shift_cuda import accumulate_uz
 from neural_shift_cuda.metropolis import metropolis_aggregate
 
 # The model's `comp_box` flag selects the boundary handling at runtime (this
@@ -110,6 +111,85 @@ def _forward_cuda(
     return Wx, None
 
 
+def _cached_metropolis_reduction_inputs(self, x: torch.Tensor, cache):
+    """Pack cached Metropolis edges once for the parallel K_hat reduction."""
+    if x.dim() != 4:
+        raise ValueError(f"x must have shape (B,C,H,W), got {tuple(x.shape)}.")
+    if x.size(1) != cache.C:
+        raise ValueError(
+            f"cached weights have C={cache.C} channels but x has "
+            f"{x.size(1)}; rebuild the cache for this channel count.")
+
+    state = getattr(self, "_metropolis_parallel_weight_cache", None)
+    shape_key = tuple(x.shape)
+    if (state is not None and state[0] is cache and state[1] == shape_key
+            and state[2] == x.device and state[3] == x.dtype):
+        return state[4], state[5]
+
+    shifts = list(cache.shifts)
+    weights = list(cache.w_hat_fwd_list)
+    if len(weights) != len(shifts) or not weights:
+        raise ValueError(
+            "cached w_hat_fwd_list must contain one tensor per cached shift.")
+    for weight in weights:
+        if tuple(weight.shape) != shape_key:
+            raise ValueError(
+                "cached weights and x must have identical (B,C,H,W) shapes; "
+                f"got {tuple(weight.shape)} and {shape_key}.")
+        if weight.device != x.device or weight.dtype != x.dtype:
+            raise ValueError("cached weights and x must share device and dtype.")
+
+    w_stack = torch.stack(weights, dim=0)  # (S,B,C,H,W), packed once per guide
+    if bool(cache.comp_box):
+        rows = [(int(dx), int(dy), int(bool(has_inv)))
+                for dx, dy, has_inv in shifts]
+        w_all = w_stack.reshape(-1, *x.shape[1:]).contiguous()
+    else:
+        # Periodic cached weights need an explicit shifted twin because the
+        # accumulate_uz inverse flag implements finite-window masking.
+        entries: List[torch.Tensor] = []
+        rows: List[Tuple[int, int, int]] = []
+        for i, (dx, dy, has_inv) in enumerate(shifts):
+            w_fwd = w_stack[i]
+            entries.append(w_fwd)
+            rows.append((int(dx), int(dy), 0))
+            if has_inv:
+                entries.append(torch.roll(
+                    w_fwd, shifts=(int(dx), int(dy)), dims=(-2, -1)))
+                rows.append((-int(dx), -int(dy), 0))
+        w_all = torch.stack(entries, dim=0).reshape(
+            -1, *x.shape[1:]).contiguous()
+
+    shifts_t = torch.tensor(rows, dtype=torch.int64, device=x.device)
+    self._metropolis_parallel_weight_cache = (
+        cache, shape_key, x.device, x.dtype, w_all, shifts_t)
+    return w_all, shifts_t
+
+
+def _forward_cached_cuda(
+    self,
+    x: torch.Tensor,
+    cache,
+    return_D: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Parallel cached Metropolis forward with one fused reduction launch.
+
+    The cache already contains the post-Metropolis edges ``w_hat_fwd`` and
+    ``degree_hat``.  Consequently this path performs only K_hat x and the
+    inexpensive diagonal/self-loop combination; it never reruns either the
+    attention network or the two-pass Metropolis construction.
+    """
+    w_all, shifts_t = _cached_metropolis_reduction_inputs(self, x, cache)
+    K_hat_x, degree_reduced = accumulate_uz(
+        x.contiguous(), w_all, shifts_t)
+    degree_hat = (
+        cache.degree_hat
+        if getattr(cache, "degree_hat", None) is not None
+        else degree_reduced)
+    Wx = x - degree_hat * x + K_hat_x
+    return (Wx, degree_hat) if return_D else (Wx, None)
+
+
 def install_cuda_shift(model_cls):
     """Patch ``model_cls.forward`` with the fused Metropolis path. Idempotent.
 
@@ -124,6 +204,7 @@ def install_cuda_shift(model_cls):
             "model_cls must provide forward(x, guide=None, sig=None).")
 
     original_forward = model_cls.forward
+    original_forward_cached = getattr(model_cls, "forward_cached", None)
 
     # Derive return_D's default from the wrapped forward so the patched
     # signature stays in lockstep with the model instead of hardcoding it, and
@@ -146,5 +227,29 @@ def install_cuda_shift(model_cls):
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward
+
+    # Optional cached-forward wiring keeps compatibility with pre-cache model
+    # versions while accelerating every cached Laplacian in the supplied file.
+    if original_forward_cached is not None:
+        _cached_sig = inspect.signature(original_forward_cached)
+        _cached_has_return_D = "return_D" in _cached_sig.parameters
+        _cached_return_D_default = (
+            _cached_sig.parameters["return_D"].default
+            if _cached_has_return_D else False)
+
+        def patched_forward_cached(
+                self, x, cache, return_D=_cached_return_D_default):
+            if not hasattr(self, "use_cuda_shift"):
+                self.use_cuda_shift = True
+            if getattr(self, "use_cuda_shift", True) and x.is_cuda:
+                return _forward_cached_cuda(
+                    self, x, cache, return_D=return_D)
+            if _cached_has_return_D:
+                return original_forward_cached(
+                    self, x, cache, return_D=return_D)
+            return original_forward_cached(self, x, cache)
+
+        model_cls.forward_cached = patched_forward_cached
+
     model_cls._metropolis_cuda_forward_installed = True
     return model_cls

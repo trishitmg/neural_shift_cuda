@@ -144,6 +144,134 @@ def _mix_heads_vec(
 
 
 # ---------------------------------------------------------------------------
+# Fixed-guide cached actions (NEW).
+#
+# GASD caches every final per-shift edge and its row degree Z.  Pack those
+# immutable tensors once, then route both Kx and K^T y through accumulate_uz's
+# cooperative tree reduction.  The transpose pack uses
+# pi^{-1}(w (.) y) = pi^{-1}(w) (.) pi^{-1}(y), exactly like the non-cached
+# CUDA transpose path below, but performs no network work.
+# ---------------------------------------------------------------------------
+
+def _cached_gasd_reduction_inputs(self, x: torch.Tensor, cache):
+    """Pack a ``GASDWeightCache`` once for the forward reduction."""
+    if x.dim() != 4:
+        raise ValueError(f"x must have shape (B,C,H,W), got {tuple(x.shape)}.")
+    if x.size(1) != cache.C:
+        raise ValueError(
+            f"cached weights have C={cache.C} channels but x has "
+            f"{x.size(1)}; rebuild the cache for this channel count.")
+
+    state = getattr(self, "_gasd_parallel_weight_cache", None)
+    shape_key = tuple(x.shape)
+    if (state is not None and state[0] is cache and state[1] == shape_key
+            and state[2] == x.device and state[3] == x.dtype):
+        return state[4], state[5]
+
+    shifts = list(cache.shifts)
+    weights = list(cache.w_list)
+    if len(weights) != len(shifts) or not weights:
+        raise ValueError("cached w_list must contain one tensor per cached shift.")
+    for weight in weights:
+        if tuple(weight.shape) != shape_key:
+            raise ValueError(
+                "cached weights and x must have identical (B,C,H,W) shapes; "
+                f"got {tuple(weight.shape)} and {shape_key}.")
+        if weight.device != x.device or weight.dtype != x.dtype:
+            raise ValueError("cached weights and x must share device and dtype.")
+
+    # Forward pack: every GASD row is a forward-only shift.
+    w_stack = torch.stack(weights, dim=0).contiguous()           # (S,B,C,H,W)
+    w_all = w_stack.reshape(-1, *x.shape[1:]).contiguous()
+    rows = [(int(dx), int(dy), 0) for dx, dy in shifts]
+    shifts_t = torch.tensor(rows, dtype=torch.int64, device=x.device)
+
+    self._gasd_parallel_weight_cache = (
+        cache, shape_key, x.device, x.dtype, w_all, shifts_t)
+    # A different forward cache invalidates the optional lazy transpose pack.
+    self._gasd_parallel_transpose_cache = None
+    return w_all, shifts_t
+
+
+def _cached_gasd_transpose_inputs(self, x: torch.Tensor, cache):
+    """Lazily create the packed inverse-rolled weights for cached ``K^T``."""
+    w_all, _ = _cached_gasd_reduction_inputs(self, x, cache)
+    state = getattr(self, "_gasd_parallel_transpose_cache", None)
+    shape_key = tuple(x.shape)
+    if (state is not None and state[0] is cache and state[1] == shape_key
+            and state[2] == x.device and state[3] == x.dtype):
+        return state[4], state[5]
+
+    shifts = list(cache.shifts)
+    S = len(shifts)
+    B, C, H, W = x.shape
+    w_stack = w_all.view(S, B, C, H, W)
+    # Roll each cached edge by its own shift in one gather and negate the
+    # gather direction.  This extra packed tensor is allocated only if a
+    # transpose-based cached operator (notably laplacian_grw_cached) is used.
+    d = torch.tensor(
+        [(int(dx), int(dy)) for dx, dy in shifts],
+        dtype=torch.int64, device=x.device)
+    hh = torch.arange(H, device=x.device).view(1, H, 1)
+    ww = torch.arange(W, device=x.device).view(1, 1, W)
+    src_h = (hh - d[:, 0].view(S, 1, 1)) % H
+    src_w = (ww - d[:, 1].view(S, 1, 1)) % W
+    roll_idx = (src_h * W + src_w).reshape(S, 1, 1, H * W)
+    w_t_stack = w_stack.reshape(S, B, C, H * W).gather(
+        3, roll_idx.expand(S, B, C, H * W)).view_as(w_stack)
+    w_t = w_t_stack.reshape(-1, C, H, W).contiguous()
+    kt_rows = [(-int(dx), -int(dy), 0) for dx, dy in shifts]
+    kt_shifts_t = torch.tensor(
+        kt_rows, dtype=torch.int64, device=x.device)
+
+    self._gasd_parallel_transpose_cache = (
+        cache, shape_key, x.device, x.dtype, w_t, kt_shifts_t)
+    return w_t, kt_shifts_t
+
+
+def _forward_cached_cuda(
+    self,
+    x: torch.Tensor,
+    cache,
+    return_D: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Overflow-safe parallel GASD cached row-stochastic action ``D^-1 Kx``."""
+    w_all, shifts_t = _cached_gasd_reduction_inputs(self, x, cache)
+    Wx, log_degree = normalized_accumulate_uz(
+        x.contiguous(), w_all, shifts_t,
+        return_log_degree=True, validate=False)
+    degree = (
+        cache.Z if getattr(cache, "Z", None) is not None
+        else log_degree.exp())
+    return (Wx, degree) if return_D else (Wx, None)
+
+
+def _kt_action_cached_cuda(self, y: torch.Tensor, cache) -> torch.Tensor:
+    """Parallel cached raw ``K^T y`` used by ``laplacian_grw_cached``.
+
+    This deliberately uses unnormalized ``accumulate_uz``: normalizing the
+    transpose-row sum would change K^T into a different stochastic operator.
+    """
+    w_t, kt_shifts_t = _cached_gasd_transpose_inputs(self, y, cache)
+    KT_y, _ = accumulate_uz(y.contiguous(), w_t, kt_shifts_t)
+    return KT_y
+
+
+def _laplacian_grw_cached_cuda(self, x: torch.Tensor, cache, eps=1e-10):
+    """Cached ``(I-W)^T(I-W)x`` with a normalized forward and raw transpose."""
+    w_all, shifts_t = _cached_gasd_reduction_inputs(self, x, cache)
+    Wx, log_degree = normalized_accumulate_uz(
+        x.contiguous(), w_all, shifts_t,
+        return_log_degree=True, validate=False)
+    z = x - Wx
+    # The architecture uses clamp_min(1e-6), independently of its legacy eps
+    # argument.  Apply the identical floor in log space.
+    log_floor = log_degree.new_tensor(1e-6).log()
+    D_inv_z = z * (-torch.maximum(log_degree, log_floor)).exp()
+    return z - _kt_action_cached_cuda(self, D_inv_z, cache)
+
+
+# ---------------------------------------------------------------------------
 # Forward replacement
 # ---------------------------------------------------------------------------
 
@@ -469,12 +597,17 @@ def _laplacian_grw_cuda(self, x, guide, sig=None, eps=1e-10):
     w_stack = _kt_weight_stack(self, x, g, sig)
     S = w_stack.shape[0]
     w_all = w_stack.reshape(S * B, C, H, W).contiguous()
-    U_num, Z = accumulate_uz(
-        x.contiguous(), w_all, _get_shift_tensor(self, x.device))
-    z = x - U_num / Z.clamp_min(1e-6)                            # L_rw x
+    Wx, log_Z = normalized_accumulate_uz(
+        x.contiguous(), w_all, _get_shift_tensor(self, x.device),
+        return_log_degree=True, validate=False)
+    z = x - Wx                                                   # L_rw x
+    # Compute z / max(Z, 1e-6) directly from log(Z).  This preserves the
+    # architecture's degree floor without ever materializing an overflowing Z.
+    log_floor = log_Z.new_tensor(1e-6).log()
+    D_inv_z = z * (-torch.maximum(log_Z, log_floor)).exp()
     w_t = _roll_stack(self, w_stack).reshape(S * B, C, H, W).contiguous()
     KT, _ = accumulate_uz(
-        (z / Z.clamp_min(1e-6)).contiguous(), w_t,
+        D_inv_z.contiguous(), w_t,
         _get_kt_shift_tensor(self, x.device))
     if not self.training:
         self.max_batch_shifts = None
@@ -496,6 +629,10 @@ def install_cuda_shift(model_cls):
 
     model_cls._get_shift_tensor = _get_shift_tensor
     original_forward = model_cls.forward
+    original_forward_cached = getattr(model_cls, "forward_cached", None)
+    original_kt_cached = getattr(model_cls, "_KT_action_cached", None)
+    original_laplacian_grw_cached = getattr(
+        model_cls, "laplacian_grw_cached", None)
 
     # Derive return_D's default from the wrapped forward so the patched
     # signature stays in lockstep with the model instead of hardcoding it, and
@@ -522,6 +659,51 @@ def install_cuda_shift(model_cls):
         return original_forward(self, x, guide=guide, sig=sig)
 
     model_cls.forward = patched_forward
+
+    # Fixed-guide cache wiring is optional for compatibility with older GASD
+    # files.  Cached Laplacian methods automatically inherit these two paths.
+    if original_forward_cached is not None:
+        _cached_sig = inspect.signature(original_forward_cached)
+        _cached_has_return_D = "return_D" in _cached_sig.parameters
+        _cached_return_D_default = (
+            _cached_sig.parameters["return_D"].default
+            if _cached_has_return_D else True)
+
+        def patched_forward_cached(
+                self, x, cache, return_D=_cached_return_D_default):
+            if not hasattr(self, "use_cuda_shift"):
+                self.use_cuda_shift = True
+            if getattr(self, "use_cuda_shift", True) and x.is_cuda:
+                return _forward_cached_cuda(
+                    self, x, cache, return_D=return_D)
+            if _cached_has_return_D:
+                return original_forward_cached(
+                    self, x, cache, return_D=return_D)
+            return original_forward_cached(self, x, cache)
+
+        model_cls.forward_cached = patched_forward_cached
+
+    if original_kt_cached is not None:
+        def patched_kt_action_cached(self, y, cache):
+            if not hasattr(self, "use_cuda_shift"):
+                self.use_cuda_shift = True
+            if getattr(self, "use_cuda_shift", True) and y.is_cuda:
+                return _kt_action_cached_cuda(self, y, cache)
+            return original_kt_cached(self, y, cache)
+
+        model_cls._KT_action_cached = patched_kt_action_cached
+
+    if original_laplacian_grw_cached is not None:
+        def patched_laplacian_grw_cached(self, x, cache, eps=1e-10):
+            if not hasattr(self, "use_cuda_shift"):
+                self.use_cuda_shift = True
+            if getattr(self, "use_cuda_shift", True) and x.is_cuda:
+                return _laplacian_grw_cached_cuda(
+                    self, x, cache, eps=eps)
+            return original_laplacian_grw_cached(
+                self, x, cache, eps=eps)
+
+        model_cls.laplacian_grw_cached = patched_laplacian_grw_cached
 
     # ---- K^T wiring: _KT_action, plus single-network-pass NLM_transpose and
     # laplacian_grw overrides (their arch references each spend TWO network
