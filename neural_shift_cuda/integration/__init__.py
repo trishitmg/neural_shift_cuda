@@ -66,6 +66,10 @@ Classic nekre model:
 # NeKDe (half-plane / per-pixel accumulate_uz path; comp_box toggled at runtime)
 from .nekde_drunet_attn_patch import install_cuda_shift as install_cuda_shift_attn
 
+# NeKDe DSG variant (forward = DSG denoiser, operator lives in NLM). Reuses the
+# base CUDA fns but patches NLM / forward_cached / _KT_action, not forward.
+from .nekde_dsg_drunet_attn_patch import install_cuda_shift as install_cuda_shift_dsg_attn
+
 # GADSD (per-channel accumulate_uz_scalar path, doubly-stochastic)
 from .gadsd_drunet_attn_patch import install_cuda_shift as install_cuda_shift_gadsd
 from .gadsd_moments_patch import install_cuda_shift as install_cuda_shift_gadsd_moments
@@ -86,6 +90,7 @@ from .nkd_metropolis_attn_patch import install_cuda_shift as install_cuda_shift_
 
 __all__ = [
     "install_cuda_shift_attn",
+    "install_cuda_shift_dsg_attn",
     "install_cuda_shift_gadsd",
     "install_cuda_shift_gadsd_moments",
     "install_cuda_shift_gasd",
