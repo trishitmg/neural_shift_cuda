@@ -87,6 +87,7 @@ from .nkd_mp_moments_patch import install_cuda_shift as install_cuda_shift_metro
 from .nekre_patch import install_cuda_shift as install_cuda_shift_nekre
 from .nectr_patch import install_cuda_shift as install_cuda_shift_nectr
 from .nkd_metropolis_attn_patch import install_cuda_shift as install_cuda_shift_metropolis
+from .nkd_metropolis_rp_attn_patch import install_cuda_shift as install_cuda_shift_metropolis_rp
 
 __all__ = [
     "install_cuda_shift_attn",
@@ -100,4 +101,5 @@ __all__ = [
     "install_cuda_shift_nekre",
     "install_cuda_shift_nectr",
     "install_cuda_shift_metropolis",
+    "install_cuda_shift_metropolis_rp",
 ]
