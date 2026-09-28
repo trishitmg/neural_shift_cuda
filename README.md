@@ -66,27 +66,28 @@ shows up directly as more training iterations per second.
 CUDA parallel patches are currently available for the three latest attention
 denoisers plus the original model:
 
-| Model arch | Class (source) | Installer | Kernel | Paper Link and Code |
-|---|---|---|---|---|
-| NeKDe attn | `NeKDeDRUNetAttn` (`NKD_drunet_attn_v2.py`, v2/v3/v4) | `install_cuda_shift_attn` | `accumulate_uz` | _to be updated soon_ |
-| GASD attn | `GASDDRUNetAttn` (`GASD_drunet_attn_v2.py`) | `install_cuda_shift_gasd` | `accumulate_uz` | _to be updated soon_ |
-| NKD_mp attn | `NeKDeMetropolisDRUNetAttn` (`NKD_mp_drunet_attn_v2.py`) | `install_cuda_shift_metropolis` | `metropolis_aggregate` | _to be updated soon_ |
-| NECTR (original) | `NECTR_denoiser` (`NECTR_models{1,2}.py`) | `install_cuda_shift_nectr` | `shift_gather`, `pair_gather`, `accumulate_uz` | [![arXiv](https://img.shields.io/badge/arXiv-2607.23347-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2607.23347) [![Code](https://img.shields.io/badge/Code-181717?logo=github&logoColor=white)](https://github.com/arghyasinha/nectr) |
+| Model arch       | Class (source)                                        | Installer                                                | Kernel                                         | Paper Link and Code                                                                                                                                                                                                                                 |
+| ---------------- | ----------------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| NeKDe attn       | `NeKDeDRUNetAttn` (`NKD_drunet_attn_v2.py`, v2/v3/v4) | `install_cuda_shift_attn`                                | `accumulate_uz`                                | _to be updated soon_                                                                                                                                                                                                                                |
+| GASD attn        | `GASDDRUNetAttn` (`GASD_drunet_attn_v2.py`)           | `install_cuda_shift_gasd`                                | `accumulate_uz`                                | _to be updated soon_                                                                                                                                                                                                                                |
+| NECTR (original) | `NECTR_denoiser` (`NECTR_models{1,2}.py`)             | `install_cuda_shift_nectr`                               | `shift_gather`, `pair_gather`, `accumulate_uz` | [![arXiv](https://img.shields.io/badge/arXiv-2607.23347-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2607.23347) [![Code](https://img.shields.io/badge/Code-181717?logo=github&logoColor=white)](https://github.com/arghyasinha/nectr) |
 
 - **NeKDe attn** — half-plane shifts, per-pixel weights, inverse-symmetry. The
   model's `comp_box` flag is read per-forward (True → finite-window mask; False →
   fully periodic).
 - **GASD attn** — full `(2R+1)^2` window, per-pixel weights, row-stochastic
   `Z^{-1}U`. `comp_box` toggles boundary handling at runtime.
-- **NKD_mp attn** — Metropolis normalization; the inverse edge is formed by a
-  circular shift of the *post-activation* forward weight inside the op, so `W` is
-  exactly symmetric and nonexpansive regardless of the output activation.
 - **NECTR (original)** — the original model from the paper (`nekre` class). 
   `pair_gather` fuses the center/shifted concatenation, then
   `accumulate_uz` does the forward + inverse-symmetric U/Z accumulation with the
   same box validity mask as the reference. Two lazy-init flags gate it:
   `use_cuda_shift` (whole CUDA path) and `use_cuda_pair_gather` (the fused
   gather). Tolerance vs the reference is ~1e-5 in fp32, exact in fp64. 
+<!--
+- **NKD_mp attn** — Metropolis normalization; the inverse edge is formed by a
+  circular shift of the *post-activation* forward weight inside the op, so `W` is
+  exactly symmetric and nonexpansive regardless of the output activation.
+-->
 
 Patches for further archs (GADSD, moments-branch) exist internally and will be listed here as they are released.
 
@@ -182,11 +183,6 @@ from GASD_drunet_attn_v2 import GASDDRUNetAttn
 from neural_shift_cuda.integration import install_cuda_shift_gasd
 install_cuda_shift_gasd(GASDDRUNetAttn)
 
-# NKD_mp attn
-from NKD_mp_drunet_attn_v2 import NeKDeMetropolisDRUNetAttn
-from neural_shift_cuda.integration import install_cuda_shift_metropolis
-install_cuda_shift_metropolis(NeKDeMetropolisDRUNetAttn)
-
 # NECTR (original icml paper model) 
 from NECTR_models{1,2} import NECTR_denoiser
 from neural_shift_cuda.integration import install_cuda_shift_nectre
@@ -205,7 +201,10 @@ cache = model.build_weight_cache(guide, sig=sigma)
 Wx, D = model.forward_cached(x, cache, return_D=True)
 ```
 
-For NeKDe and Metropolis, `forward_cached` packs the cached half-plane weights
+<!-- For NeKDe and Metropolis, `forward_cached` packs the cached half-plane weights
+once and applies the symmetric shift-and-sum with one fused parallel reduction
+per call. -->
+For NeKDe, `forward_cached` packs the cached half-plane weights
 once and applies the symmetric shift-and-sum with one fused parallel reduction
 per call. For GASD, both `forward_cached` and `_KT_action_cached` are patched;
 therefore `laplacian_grw_cached` uses parallel cached `Kx` and `K.T @ x`
@@ -226,44 +225,46 @@ speed-up is better; the **full step (fwd+bwd)** row is what training
 iterations/second track.
 
 ### NeKDe-Attn
-| Stage | Serial (ms) | Parallel (ms) | Speed-up |
-|---|--:|--:|--:|
-| Forward (inference) | 19.17 | 12.45 | 1.54× |
-| Forward (train) | 24.15 | 12.32 | 1.96× |
-| Backward | 116.22 | 50.72 | 2.29× |
-| **Full step (fwd+bwd)** | **140.37** | **63.03** | **2.23×** |
+| Stage                   | Serial (ms) | Parallel (ms) |  Speed-up |
+| ----------------------- | ----------: | ------------: | --------: |
+| Forward (inference)     |       19.17 |         12.45 |     1.54× |
+| Forward (train)         |       24.15 |         12.32 |     1.96× |
+| Backward                |      116.22 |         50.72 |     2.29× |
+| **Full step (fwd+bwd)** |  **140.37** |     **63.03** | **2.23×** |
 
 ### GASD-Attn
-| Stage | Serial (ms) | Parallel (ms) | Speed-up |
-|---|--:|--:|--:|
-| Forward (inference) | 22.33 | 21.09 | 1.06× |
-| Forward (train) | 25.56 | 20.97 | 1.22× |
-| Backward | 151.45 | 113.83 | 1.33× |
-| **Full step (fwd+bwd)** | **177.02** | **134.81** | **1.31×** |
+| Stage                   | Serial (ms) | Parallel (ms) |  Speed-up |
+| ----------------------- | ----------: | ------------: | --------: |
+| Forward (inference)     |       22.33 |         21.09 |     1.06× |
+| Forward (train)         |       25.56 |         20.97 |     1.22× |
+| Backward                |      151.45 |        113.83 |     1.33× |
+| **Full step (fwd+bwd)** |  **177.02** |    **134.81** | **1.31×** |
 
+<!--
 ### METRO-NeKDe-Attn
-| Stage | Serial (ms) | Parallel (ms) | Speed-up |
-|---|--:|--:|--:|
-| Forward (inference) | 34.32 | 12.73 | 2.70× |
-| Forward (train) | 43.94 | 15.41 | 2.85× |
-| Backward | 148.99 | 75.61 | 1.97× |
-| **Full step (fwd+bwd)** | **192.92** | **91.02** | **2.12×** |
+| Stage                   | Serial (ms) | Parallel (ms) |  Speed-up |
+| ----------------------- | ----------: | ------------: | --------: |
+| Forward (inference)     |       34.32 |         12.73 |     2.70× |
+| Forward (train)         |       43.94 |         15.41 |     2.85× |
+| Backward                |      148.99 |         75.61 |     1.97× |
+| **Full step (fwd+bwd)** |  **192.92** |     **91.02** | **2.12×** |
+-->
 
 ### NECTR1 (original)
-| Stage | Serial (ms) | Parallel (ms) | Speed-up |
-|---|--:|--:|--:|
-| Forward (inference) | 56.62 | 47.70 | 1.19× |
-| Forward (train) | 57.65 | 48.55 | 1.19× |
-| Backward | 125.13 | 64.85 | 1.93× |
-| **Full step (fwd+bwd)** | **182.79** | **113.34** | **1.61×** |
+| Stage                   | Serial (ms) | Parallel (ms) |  Speed-up |
+| ----------------------- | ----------: | ------------: | --------: |
+| Forward (inference)     |       56.62 |         47.70 |     1.19× |
+| Forward (train)         |       57.65 |         48.55 |     1.19× |
+| Backward                |      125.13 |         64.85 |     1.93× |
+| **Full step (fwd+bwd)** |  **182.79** |    **113.34** | **1.61×** |
 
 ### NECTR2 (original)
-| Stage | Serial (ms) | Parallel (ms) | Speed-up |
-|---|--:|--:|--:|
-| Forward (inference) | 164.32 | 135.88 | 1.21× |
-| Forward (train) | 171.81 | 137.10 | 1.25× |
-| Backward | 329.22 | 239.44 | 1.38× |
-| **Full step (fwd+bwd)** | **501.04** | **376.43** | **1.33×** |
+| Stage                   | Serial (ms) | Parallel (ms) |  Speed-up |
+| ----------------------- | ----------: | ------------: | --------: |
+| Forward (inference)     |      164.32 |        135.88 |     1.21× |
+| Forward (train)         |      171.81 |        137.10 |     1.25× |
+| Backward                |      329.22 |        239.44 |     1.38× |
+| **Full step (fwd+bwd)** |  **501.04** |    **376.43** | **1.33×** |
 
 Reproduce with `python tests/benchmark_archs.py --config tests/configs/<arch>.yaml`.
 
