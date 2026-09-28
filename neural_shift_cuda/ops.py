@@ -228,7 +228,12 @@ def _as_log_weights(weights: torch.Tensor, log_weights: bool) -> torch.Tensor:
     if log_weights:
         return weights
     neg_inf_value = torch.full_like(weights, -torch.inf)
-    return torch.where(weights > 0, weights.log(), neg_inf_value)
+    positive = weights > 0
+    # log of a masked (zero) weight would backpropagate 0 * inf = NaN through
+    # torch.where; take the log of 1 there instead, so masked entries get a zero
+    # gradient -- what the CUDA backward returns for them.
+    safe = torch.where(positive, weights, torch.ones_like(weights))
+    return torch.where(positive, safe.log(), neg_inf_value)
 
 
 def normalized_accumulate_uz_reference(

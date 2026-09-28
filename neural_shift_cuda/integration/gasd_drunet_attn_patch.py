@@ -20,15 +20,22 @@ GASD vs NeKDe (why this is a separate patch)
 --------------------------------------------
 GASD is the ROW-stochastic (singly-stochastic) denoiser  W = Z^{-1}U:
   * `_collect_shifts()` returns ALL (2R+1)^2 shifts as (dx, dy) pairs (no
-    half-plane, no `has_inverse` flag), and the weight of every shift is
-    produced independently by the network;
+    half-plane, no `has_inverse` flag), aligned with `_all_shift_weights`.
+    With shift_mode='legacy' (and older files) every shift's weight is
+    produced independently; with shift_mode='inverse_pair' (the truncated
+    GASD_drunet_attn_v2 default) the head scores only the J = 2R^2+2R+1
+    half-plane shifts and pi^{-1} reuses pi's map unshifted,
+        K = D_id + sum_{pi in I+} D_pi (P_pi + P_{pi^{-1}});
   * `forward` accumulates each shift exactly ONCE -- there is no circular-shift
     inverse twin, so U is non-symmetric and K = Z^{-1}U is only row-stochastic.
 The NeKDe patch, by contrast, feeds a half-plane shift list with `has_inverse=1`
-and lets `accumulate_uz` synthesise the symmetric twin. Here we instead build
-the (S, 3) shift tensor with the inverse flag set to 0 on EVERY row, so
-`accumulate_uz` performs the forward circular gather only -- the exact
-full-window, non-symmetric operator GASD's reference forward computes.
+and lets `accumulate_uz` synthesise the symmetric twin P_{pi^{-1}} D_pi. That is
+NOT the inverse_pair edge D_pi P_{pi^{-1}}, so here the (S, 3) shift tensor has
+the inverse flag set to 0 on EVERY row and `accumulate_uz` performs the forward
+circular gather only -- the exact full-window, non-symmetric operator GASD's
+reference forward computes, in either shift_mode. Under inverse_pair only the
+weight-stack construction differs (`_masked_weight_stack`: J maps head-mixed,
+then expanded).
 
 comp_box toggle
 ---------------
@@ -59,6 +66,10 @@ Usage
     from GASD_drunet_attn_v2 import GASDDRUNetAttn
     from gasd_drunet_attn_patch import install_cuda_shift
     install_cuda_shift(GASDDRUNetAttn)
+
+The same installer covers GASDDRUNetFeatAttn (GASD_drunet_featattn_v2.py) and
+GASDMambaAttn (GASD_mamba_attn.py): only phi(guide) differs, and it is taken
+from the model's own `pre_activation`.
 
 After this, every GASDDRUNetAttn instance routes its forward through the CUDA
 path when the input is on a CUDA device. To disable per-instance:
@@ -103,6 +114,24 @@ def _get_shift_tensor(self, device: torch.device) -> torch.Tensor:
     return self._cached_shift_tensor
 
 
+def _norm_sig(self, x: torch.Tensor, sig):
+    """sigma -> (B, 1, 1, 1). Truncated GASD files own a `_normalise_sigma` that
+    also accepts (B,) / per-sample shapes (and requires sig); use it so the patch
+    accepts exactly what the reference forward accepts. Older files keep the
+    original prologue."""
+    if hasattr(self, "_normalise_sigma"):
+        return self._normalise_sigma(x, sig)
+    B = x.size(0)
+    if sig is not None and not torch.is_tensor(sig):
+        return x.new_full((B, 1, 1, 1), float(sig))
+    if sig is not None:
+        if sig.dim() == 0:
+            return sig.view(1, 1, 1, 1).expand(B, 1, 1, 1)
+        if sig.shape[0] == 1 and B > 1:
+            return sig.expand(B, -1, -1, -1)
+    return sig
+
+
 def _head_mix_mat(self) -> Optional[torch.Tensor]:
     """Build the (C, n_heads) head-mixing matrix using the model's own
     `head_mix_pos_act`. Matches GASDDRUNetAttn.forward exactly; defaults to
@@ -141,6 +170,49 @@ def _mix_heads_vec(
     if n_heads == C:
         return w_stack
     return w_stack.mean(dim=2, keepdim=True).expand(-1, -1, C, -1, -1)
+
+
+def _masked_weight_stack(self, phi, sig, ref: torch.Tensor) -> torch.Tensor:
+    """Head-mixed, comp_box-masked per-shift weights (S, B, C, H, W) in
+    `_collect_shifts` order, from the model's projection-once gather path.
+
+    shift_mode='inverse_pair' scores only the J = 2R^2+2R+1 half-plane shifts
+    and reuses pi's map, unshifted, for pi^{-1}. The J maps are head-mixed once
+    and then expanded with the model's own `_pair_up` ordering (an index
+    select), instead of stacking and mixing all (2R+1)^2 copies. Each
+    translation still gets its own mask, and the (S, ...) stack is what
+    accumulate_uz consumes. Legacy / older GASD files take the generic path.
+    """
+    B, C, H, W = ref.shape
+    R = self.window_rad
+    padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
+    shift_list = self._collect_shifts()
+    head_mix_mat = _head_mix_mat(self)
+    if getattr(self, "shift_mode", None) == "inverse_pair" and hasattr(self, "_pair_up"):
+        scored = list(self._gather_core(phi, padded_phi, sig))
+        w_half = _mix_heads_vec(torch.stack(scored, dim=0), C, head_mix_mat)
+        key = (len(scored), str(ref.device))
+        if getattr(self, "_cached_pair_key", None) != key:
+            self._cached_pair_index = torch.tensor(
+                self._pair_up(list(range(len(scored)))),
+                dtype=torch.int64, device=ref.device)
+            self._cached_pair_key = key
+        w_stack = w_half.index_select(0, self._cached_pair_index)
+    else:
+        weights_list = self._all_shift_weights(phi, padded_phi, sig, shift_list)
+        w_stack = _mix_heads_vec(
+            torch.stack(list(weights_list), dim=0), C, head_mix_mat)
+    if bool(getattr(self, "comp_box", True)):
+        # comp_box mask, built exactly like the model's zero-padded `ones`
+        # box; depends only on the shift, so (S, 1, 1, H, W) broadcasts.
+        box = F.pad(
+            torch.ones(1, 1, H, W, device=ref.device, dtype=ref.dtype),
+            (R, R, R, R), mode="constant", value=0.0)
+        mask_stack = torch.stack(
+            [box[:, :, R + dx: R + dx + H, R + dy: R + dy + W]
+             for (dx, dy) in shift_list], dim=0)                 # (S, 1, 1, H, W)
+        w_stack = w_stack * mask_stack
+    return w_stack
 
 
 # ---------------------------------------------------------------------------
@@ -295,14 +367,8 @@ def _forward_cuda(
     B, C, H, W = x.shape
     R = self.window_rad
 
-    # ---- Normalise sigma to (B, 1, 1, 1) (verbatim from original) ----
-    if sig is not None and not torch.is_tensor(sig):
-        sig = x.new_full((B, 1, 1, 1), float(sig))
-    elif sig is not None:
-        if sig.dim() == 0:
-            sig = sig.view(1, 1, 1, 1).expand(B, 1, 1, 1)
-        elif sig.shape[0] == 1 and B > 1:
-            sig = sig.expand(B, -1, -1, -1)
+    # ---- Normalise sigma to (B, 1, 1, 1) ----
+    sig = _norm_sig(self, x, sig)
 
     # ---- Guide features ----
     g_input = x if guide is None else guide
@@ -335,22 +401,7 @@ def _forward_cuda(
     # fused via accumulate_uz (has_inverse=0 -> forward-only, row-stochastic).
     # ------------------------------------------------------------------
     if hasattr(self, "_gather_core"):
-        shifts_list = self._collect_shifts()                     # [(dx, dy), ...]
-        padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
-        weights_list = self._all_shift_weights(
-            phi, padded_phi, sig, shifts_list)
-        w_stack = torch.stack(list(weights_list), dim=0)         # (S, B, h, H, W)
-        w_stack = _mix_heads_vec(w_stack, C, head_mix_mat)       # (S, B, C, H, W)
-        if use_box:
-            # comp_box mask, built exactly like the model's zero-padded `ones`
-            # box; depends only on the shift, so (S, 1, 1, H, W) broadcasts.
-            box = F.pad(
-                torch.ones(1, 1, H, W, device=x.device, dtype=x.dtype),
-                (R, R, R, R), mode="constant", value=0.0)
-            mask_stack = torch.stack(
-                [box[:, :, R + dx: R + dx + H, R + dy: R + dy + W]
-                 for (dx, dy) in shifts_list], dim=0)            # (S, 1, 1, H, W)
-            w_stack = w_stack * mask_stack
+        w_stack = _masked_weight_stack(self, phi, sig, x)       # (S, B, C, H, W)
         w_all = w_stack.reshape(S * B, C, H, W).contiguous()
         U, log_Z = normalized_accumulate_uz(
             x.contiguous(), w_all, shifts_t,
@@ -504,24 +555,9 @@ def _kt_weight_stack(self, ref: torch.Tensor, guide, sig) -> torch.Tensor:
     """ONE network pass -> comp_box-masked per-shift weights (S, B, C, H, W).
     Same construction as the forward (delegates to the model's own
     _all_shift_weights), so K and K^T are built from identical entries."""
-    B, C, H, W = ref.shape
-    R = self.window_rad
     g_input = ref if guide is None else guide
     phi = self.pre_activation(g_input, sigma=sig).contiguous()
-    padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
-    shift_list = self._collect_shifts()
-    weights_list = self._all_shift_weights(phi, padded_phi, sig, shift_list)
-    w_stack = _mix_heads_vec(
-        torch.stack(list(weights_list), dim=0), C, _head_mix_mat(self))
-    if bool(getattr(self, "comp_box", True)):
-        box = F.pad(
-            torch.ones(1, 1, H, W, device=ref.device, dtype=ref.dtype),
-            (R, R, R, R), mode="constant", value=0.0)
-        mask_stack = torch.stack(
-            [box[:, :, R + dx: R + dx + H, R + dy: R + dy + W]
-             for (dx, dy) in shift_list], dim=0)                 # (S, 1, 1, H, W)
-        w_stack = w_stack * mask_stack
-    return w_stack
+    return _masked_weight_stack(self, phi, sig, ref)
 
 
 def _kt_action_cuda(self, y, guide=None, sig=None):
@@ -529,14 +565,8 @@ def _kt_action_cuda(self, y, guide=None, sig=None):
     if not self.training:
         self.max_batch_shifts = 10
     B, C, H, W = y.shape
-    # ---- Normalise sigma to (B, 1, 1, 1) (verbatim from original) ----
-    if sig is not None and not torch.is_tensor(sig):
-        sig = y.new_full((B, 1, 1, 1), float(sig))
-    elif sig is not None:
-        if sig.dim() == 0:
-            sig = sig.view(1, 1, 1, 1).expand(B, 1, 1, 1)
-        elif sig.shape[0] == 1 and B > 1:
-            sig = sig.expand(B, -1, -1, -1)
+    # ---- Normalise sigma to (B, 1, 1, 1) ----
+    sig = _norm_sig(self, y, sig)
 
     w_stack = _kt_weight_stack(self, y, guide, sig)
     S = w_stack.shape[0]
@@ -555,14 +585,8 @@ def _nlm_transpose_cuda(self, x, guide=None, sig=None, return_D=False):
     if not self.training:
         self.max_batch_shifts = 10
     B, C, H, W = x.shape
-    # ---- Normalise sigma to (B, 1, 1, 1) (verbatim from original) ----
-    if sig is not None and not torch.is_tensor(sig):
-        sig = x.new_full((B, 1, 1, 1), float(sig))
-    elif sig is not None:
-        if sig.dim() == 0:
-            sig = sig.view(1, 1, 1, 1).expand(B, 1, 1, 1)
-        elif sig.shape[0] == 1 and B > 1:
-            sig = sig.expand(B, -1, -1, -1)
+    # ---- Normalise sigma to (B, 1, 1, 1) ----
+    sig = _norm_sig(self, x, sig)
 
     g = x if guide is None else guide
     w_stack = _kt_weight_stack(self, x, g, sig)
@@ -584,14 +608,8 @@ def _laplacian_grw_cuda(self, x, guide, sig=None, eps=1e-10):
     if not self.training:
         self.max_batch_shifts = 10
     B, C, H, W = x.shape
-    # ---- Normalise sigma to (B, 1, 1, 1) (verbatim from original) ----
-    if sig is not None and not torch.is_tensor(sig):
-        sig = x.new_full((B, 1, 1, 1), float(sig))
-    elif sig is not None:
-        if sig.dim() == 0:
-            sig = sig.view(1, 1, 1, 1).expand(B, 1, 1, 1)
-        elif sig.shape[0] == 1 and B > 1:
-            sig = sig.expand(B, -1, -1, -1)
+    # ---- Normalise sigma to (B, 1, 1, 1) ----
+    sig = _norm_sig(self, x, sig)
 
     g = x if guide is None else guide
     w_stack = _kt_weight_stack(self, x, g, sig)

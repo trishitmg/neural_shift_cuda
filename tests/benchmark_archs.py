@@ -32,6 +32,7 @@ _ARCHS = {
     "nekde":  ("install_cuda_shift_attn",       "NeKDeDRUNetAttn",           {}),
     "gasd":   ("install_cuda_shift_gasd",       "GASDDRUNetAttn",            {}),
     "nkd_mp": ("install_cuda_shift_metropolis", "NeKDeMetropolisDRUNetAttn", {}),
+    "nkd_mp_dss": ("install_cuda_shift_metropolis_dss", "NeKDeDSSDRUNetAttn",     {}),
     "neckre":  ("install_cuda_shift_nekre", "nekre",  {"batched": True}),
     "nectr":  ("install_cuda_shift_nectr", "nectr",  {}),
 }

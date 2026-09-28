@@ -75,7 +75,7 @@ else:
 
 setup(
     name="neural_shift_cuda",
-    version="0.12.55",
+    version="0.13.0",
     description="CUDA shift-gather and promoted-precision parallel tree reductions, including overflow-safe normalized aggregation, for NeKDe / GASD denoisers.",
     # picks up neural_shift_cuda/ and neural_shift_cuda/integration/
     packages=find_packages(),

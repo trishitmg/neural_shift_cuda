@@ -31,11 +31,21 @@ is kept as a back-compat alias of ``install_cuda_shift_gadsd_moments``:
 
 GASD (full (2R+1)^2 window, per-pixel weights, row-stochastic Z^{-1}U). The
 model's ``comp_box`` flag toggles boundary handling at runtime (True ->
-comp_box / masked; False -> fully circular):
+comp_box / masked; False -> fully circular). Both ``shift_mode`` values
+('inverse_pair' default, 'legacy') and the featattn / mamba variants use the
+same installer:
 
     from neural_shift_cuda.integration import install_cuda_shift_gasd
     from GASD_drunet_attn_v2 import GASDDRUNetAttn
     install_cuda_shift_gasd(GASDDRUNetAttn)
+
+Doubly sub-stochastic NKD (NKD_mp_dss_*: symmetric or asymmetric inverse-pair
+kernel, W_ij = K_ij / max(r_i, c_j), optional diagonal correction). Patches
+forward / adjoint / laplacian_grw and the cached forward / adjoint:
+
+    from neural_shift_cuda.integration import install_cuda_shift_mp_dss
+    from NKD_mp_dss_drunet_attn_v2 import NeKDeDSSDRUNetAttn
+    install_cuda_shift_mp_dss(NeKDeDSSDRUNetAttn)
 
 Moments-branch NeKDe / GASD / Metropolis (the *_moments ports whose weight
 producer is the GADSD moments pair -- TinyMomentFeatureExtractor +
@@ -88,6 +98,7 @@ from .nekre_patch import install_cuda_shift as install_cuda_shift_nekre
 from .nectr_patch import install_cuda_shift as install_cuda_shift_nectr
 from .nkd_metropolis_attn_patch import install_cuda_shift as install_cuda_shift_metropolis
 from .nkd_metropolis_rp_attn_patch import install_cuda_shift as install_cuda_shift_metropolis_rp
+from .nkd_metropolis_dss_attn_patch import install_cuda_shift as install_cuda_shift_metropolis_dss
 
 __all__ = [
     "install_cuda_shift_attn",
@@ -102,4 +113,5 @@ __all__ = [
     "install_cuda_shift_nectr",
     "install_cuda_shift_metropolis",
     "install_cuda_shift_metropolis_rp",
+    "install_cuda_shift_metropolis_dss",
 ]
