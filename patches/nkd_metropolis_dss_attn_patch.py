@@ -19,6 +19,8 @@ differentiable primitives; the attention head is still the model's own
     `shift_gather`. W^T y = W y.
   * asymmetric -- the mirror edge keeps the centre-pixel weight, which is not
     what has_inverse=1 synthesises, so the full (2R+1)^2 edge stack is built
+    (with shift_mode='legacy' the head already scores all (2R+1)^2 shifts and
+    the stack is just the masked head maps)
     (has_inverse=0 rows). K^T e and C are one batched roll (gather) + sum over
     the stack; W^T y is `accumulate_uz` with negated shifts on the rolled stack
     (pi^{-1}(w (.) y) = pi^{-1}(w) (.) pi^{-1}(y)).
@@ -58,7 +60,8 @@ from neural_shift_cuda import accumulate_uz, shift_gather
 # ---------------------------------------------------------------------------
 
 def _static(self, H: int, W: int, device: torch.device, dtype: torch.dtype) -> dict:
-    key = (H, W, device, dtype, self.window_rad, self.kernel_mode)
+    pair = getattr(self, "shift_mode", "inverse_pair") != "legacy"
+    key = (H, W, device, dtype, self.window_rad, self.kernel_mode, pair)
     state = getattr(self, "_dss_static", None)
     if state is not None and state[0] == key:
         return state[1]
@@ -78,6 +81,7 @@ def _static(self, H: int, W: int, device: torch.device, dtype: torch.dtype) -> d
 
     nonid = [k for k, s in enumerate(scored) if s != (0, 0)]
     st = dict(
+        pair=pair,
         i0=scored.index((0, 0)),
         mask_fwd=masks(scored),
         # symmetric: half-plane rows, mirror edge synthesised by accumulate_uz
@@ -86,7 +90,8 @@ def _static(self, H: int, W: int, device: torch.device, dtype: torch.dtype) -> d
     )
     if self.kernel_mode == "asymmetric":
         # full edge list in the model's _collect_shifts order (scored first,
-        # then pi^{-1} for pi in I+), so the identity row index is the same.
+        # then pi^{-1} for pi in I+; legacy: the scored full window only), so
+        # the identity row index is the same.
         hh = torch.arange(H, device=device).view(1, H, 1)
         ww = torch.arange(W, device=device).view(1, 1, W)
         d = torch.tensor(full, dtype=torch.int64, device=device)
@@ -94,7 +99,7 @@ def _static(self, H: int, W: int, device: torch.device, dtype: torch.dtype) -> d
         src = ((hh - d[:, 0].view(S, 1, 1)) % H) * W + (ww - d[:, 1].view(S, 1, 1)) % W
         st.update(
             nonid=torch.tensor(nonid, dtype=torch.int64, device=device),
-            mask_rev=masks([(-scored[k][0], -scored[k][1]) for k in nonid]),
+            mask_rev=masks([(-scored[k][0], -scored[k][1]) for k in nonid]) if pair else None,
             rows_full=rows(full, [0] * S),
             rows_full_T=rows([(-dx, -dy) for dx, dy in full], [0] * S),
             xy_full=d,
@@ -156,7 +161,8 @@ def _operator(m: torch.Tensor, st: dict, sym: bool, corr: bool, eps: float):
             w = torch.cat([w[:i0], (1.0 - (d_hat.to(m.dtype) - w[i0])).unsqueeze(0), w[i0 + 1:]])
         return w.reshape(-1, C, H, W), rows
 
-    e = torch.cat([e, m.index_select(0, st["nonid"]) * st["mask_rev"]], dim=0)  # (S,...)
+    if st["pair"]:  # inverse_pair: pi^{-1} reuses pi's map; legacy: e is already full
+        e = torch.cat([e, m.index_select(0, st["nonid"]) * st["mask_rev"]], dim=0)  # (S,...)
     S = e.size(0)
     r = e.sum(0)
     c = _unshift(e, st["roll"]).sum(0)                          # K^T e

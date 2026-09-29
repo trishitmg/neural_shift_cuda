@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from neural_shift_cuda.integration import gasd_drunet_attn_patch as gasd_patch
-from neural_shift_cuda.integration import nkd_metropolis_dss_attn_patch as dss_patch
+from neural_shift_cuda.integration import nkd_mp_dss_attn_patch as dss_patch
 
 MODEL_DIR = os.environ.get("NSC_MODEL_DIR", "/mnt/user-data/uploads")
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
@@ -136,11 +136,13 @@ def test_gasd_patch_matches_reference(device, shift_mode, arch):
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("diag_correction", [False, True])
-@pytest.mark.parametrize("kernel_mode", ["asymmetric", "symmetric"])
+@pytest.mark.parametrize("kernel_mode,shift_mode", [
+    ("asymmetric", "inverse_pair"), ("symmetric", "inverse_pair"), ("asymmetric", "legacy")])
 @pytest.mark.parametrize("arch", list(DSS_ARCHS))
-def test_dss_patch_matches_reference(device, kernel_mode, diag_correction, arch):
+def test_dss_patch_matches_reference(device, kernel_mode, shift_mode, diag_correction, arch):
     m = _model(DSS_ARCHS, arch, dss_patch.install_cuda_shift, device,
-               kernel_mode=kernel_mode, diag_correction=diag_correction)
+               kernel_mode=kernel_mode, shift_mode=shift_mode,
+               diag_correction=diag_correction)
     x, z, y, sig = _inputs(device)
 
     Wx, We = dss_patch._forward_cuda(m, x, guide=z, sig=sig, return_D=True)
