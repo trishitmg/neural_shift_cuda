@@ -4,10 +4,12 @@ The model builds, per guide, J = 2R^2 + 2R + 1 head-mixed maps on the
 half-plane G+ = {id} u I+ and turns them into the kernel K (`kernel_mode`):
   'symmetric'   K = D_id + sum_{pi in I+} (D_pi P_pi + P_{pi^{-1}} D_pi)
   'asymmetric'  K = D_id + sum_{pi in I+} D_pi (P_pi + P_{pi^{-1}})
-then normalises it with r = K e, c = K^T e:
-    W_{i,i+d} = K_{i,i+d} / max(r_i, (P_d c)_i),
-and, with `diag_correction`, resets W_ii = 1 - max(R_i, C_i) (off-diagonal
-row / column sums of W).
+then scales it to H with r = K e, c = K^T e (`mu_mode`):
+    'local'   H_{i,i+d} = K_{i,i+d} / max(r_i, (P_d c)_i),
+    'global'  H = K / max(||r||_inf, ||c||_inf)  per (image, channel),
+and, with `diag_correction`, adds the rank-one completion
+    W = H + p q^T / nu,   p = e - H e, q = e - H^T e, nu = e^T p
+(W = H otherwise).
 
 This patch replaces the per-shift Python loops by the package's fused,
 differentiable primitives; the attention head is still the model's own
@@ -24,8 +26,11 @@ differentiable primitives; the attention head is still the model's own
     (has_inverse=0 rows). K^T e and C are one batched roll (gather) + sum over
     the stack; W^T y is `accumulate_uz` with negated shifts on the rolled stack
     (pi^{-1}(w (.) y) = pi^{-1}(w) (.) pi^{-1}(y)).
-In both, the diagonal of W is folded into the identity row, so one
-`accumulate_uz` applies W and its Z output is W e.
+In both, the diagonal of H is folded into the identity row, so one
+`accumulate_uz` applies the banded part and its Z output is its row sum. With
+'global' the rows carry K itself and 1/mu multiplies the result; with
+`diag_correction` the rank-one term (q^T v / nu) p (transpose: (p^T v / nu) q)
+is added after the call, so the dense p q^T is never formed.
 
 Patched: forward, adjoint, laplacian_grw, forward_cached, adjoint_cached.
 DSG_NLM, laplacian_{un,rw,norm} and the *_cached Laplacians route through
@@ -139,51 +144,105 @@ def _mixed_half(self, x: torch.Tensor, guide, sig) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# W as an accumulate_uz operand: W v = accumulate_uz(v, w, rows)[0], and the
-# Z output of the same call is W e.
+# W as an accumulate_uz operand plus a scale and a rank-one term:
+#   op = (w, rows, scale, p, q, inv_nu),
+#   H v = scale * accumulate_uz(v, w, rows)[0]      (scale None -> 1),
+#   W v = H v + (q^T v) inv_nu p                    (p None -> W = H).
 # ---------------------------------------------------------------------------
 
-def _operator(m: torch.Tensor, st: dict, sym: bool, corr: bool, eps: float):
+def _spatial_sum(t: torch.Tensor) -> torch.Tensor:
+    """Per (image, channel) pixel sum, accumulated in >= fp32 (the model's
+    _spatial_sum: nu is O(H*W) and would overflow fp16)."""
+    return t.sum(dim=(-2, -1), keepdim=True,
+                 dtype=torch.promote_types(t.dtype, torch.float32))
+
+
+def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps: float):
     J, B, C, H, W = m.shape
-    i0 = st["i0"]
     e = m * st["mask_fwd"]                                      # forward edges
+    He = HTe = None
+    scale = None
 
     if sym:
         rows = st["rows_half"]
         ones = torch.ones(B, C, H, W, device=m.device, dtype=m.dtype)
         _, r = accumulate_uz(ones, e.reshape(-1, C, H, W), rows)  # r = K e = K^T e
         r = r.to(m.dtype)
-        Pr, _ = shift_gather(r, st["xy_half"])                  # r_{i+d}
-        w = e / torch.maximum(r.unsqueeze(0), Pr.view(J, B, C, H, W)).clamp_min(eps)
-        if corr:
-            # d_hat = W_hat e incl. the identity, so 1 - (d_hat - w_id) = 1 - R.
-            _, d_hat = accumulate_uz(ones, w.reshape(-1, C, H, W), rows)
-            w = torch.cat([w[:i0], (1.0 - (d_hat.to(m.dtype) - w[i0])).unsqueeze(0), w[i0 + 1:]])
-        return w.reshape(-1, C, H, W), rows
+        if glob:
+            w = e                                               # rows carry K itself
+            scale = 1.0 / r.amax(dim=(-2, -1), keepdim=True)
+            He = r * scale
+        else:
+            Pr, _ = shift_gather(r, st["xy_half"])              # r_{i+d}
+            w = e / torch.maximum(r.unsqueeze(0), Pr.view(J, B, C, H, W)).clamp_min(eps)
+            if corr:
+                He = accumulate_uz(ones, w.reshape(-1, C, H, W), rows)[1].to(m.dtype)
+        HTe = He                                                # H = H^T
+    else:
+        rows = st["rows_full"]
+        if st["pair"]:  # inverse_pair: pi^{-1} reuses pi's map; legacy: e is already full
+            e = torch.cat([e, m.index_select(0, st["nonid"]) * st["mask_rev"]], dim=0)  # (S,...)
+        S = e.size(0)
+        r = e.sum(0)
+        c = _unshift(e, st["roll"]).sum(0)                      # K^T e
+        if glob:
+            w = e
+            scale = 1.0 / torch.maximum(r.amax(dim=(-2, -1), keepdim=True),
+                                        c.amax(dim=(-2, -1), keepdim=True))
+            He, HTe = r * scale, c * scale
+        else:
+            Pc, _ = shift_gather(c, st["xy_full"])              # c_{i+d}
+            w = e / torch.maximum(r.unsqueeze(0), Pc.view(S, B, C, H, W)).clamp_min(eps)
+            if corr:
+                He, HTe = w.sum(0), _unshift(w, st["roll"]).sum(0)
 
-    if st["pair"]:  # inverse_pair: pi^{-1} reuses pi's map; legacy: e is already full
-        e = torch.cat([e, m.index_select(0, st["nonid"]) * st["mask_rev"]], dim=0)  # (S,...)
-    S = e.size(0)
-    r = e.sum(0)
-    c = _unshift(e, st["roll"]).sum(0)                          # K^T e
-    Pc, _ = shift_gather(c, st["xy_full"])                      # c_{i+d}
-    w = e / torch.maximum(r.unsqueeze(0), Pc.view(S, B, C, H, W)).clamp_min(eps)
-    if corr:
-        # The identity row is unaffected by the roll, so subtracting it from the
-        # full sums leaves the off-diagonal row / column sums R, C.
-        R_ = w.sum(0) - w[i0]
-        C_ = _unshift(w, st["roll"]).sum(0) - w[i0]
-        w = torch.cat([w[:i0], (1.0 - torch.maximum(R_, C_)).unsqueeze(0), w[i0 + 1:]])
-    return w.reshape(-1, C, H, W), st["rows_full"]
+    w = w.reshape(-1, C, H, W)
+    if not corr:
+        return w, rows, scale, None, None, None
+    # As the model: deficits clamped at 0 (W >= 0 exactly), nu = e^T p, nu = 0 -> W = H.
+    p = (1.0 - He).clamp_min(0.0)
+    q = p if sym else (1.0 - HTe).clamp_min(0.0)
+    nu = _spatial_sum(p)
+    inv_nu = torch.where(nu > 0, nu.clamp_min(torch.finfo(nu.dtype).tiny).reciprocal(),
+                         torch.zeros_like(nu))
+    return w, rows, scale, p, q, inv_nu
 
 
-def _apply_T(v: torch.Tensor, w: torch.Tensor, rows: torch.Tensor, st: dict, sym: bool):
+def _finish(Hv: torch.Tensor, v: torch.Tensor, scale, a, b, inv_nu) -> torch.Tensor:
+    """scale * (banded result) + (b^T v) inv_nu a; (a, b) = (p, q) for W, (q, p) for W^T."""
+    if scale is not None:
+        Hv = Hv * scale
+    if a is not None:
+        Hv = Hv + (_spatial_sum(b * v) * inv_nu).to(Hv.dtype) * a
+    return Hv
+
+
+def _row_sum(Z: torch.Tensor, scale, p, q, inv_nu) -> torch.Tensor:
+    """W e from the banded row sum Z = accumulate_uz(., w, rows)[1]."""
+    if scale is not None:
+        Z = Z * scale
+    if p is not None:
+        Z = Z + (_spatial_sum(q) * inv_nu).to(Z.dtype) * p
+    return Z
+
+
+def _apply(v: torch.Tensor, op):
+    """(W v, W e) for the operand returned by _operator."""
+    w, rows, scale, p, q, inv_nu = op
+    Hv, Z = accumulate_uz(v, w, rows)
+    return _finish(Hv, v, scale, p, q, inv_nu), _row_sum(Z, scale, p, q, inv_nu)
+
+
+def _apply_T(v: torch.Tensor, op, st: dict, sym: bool):
     """W^T v for the operand returned by _operator."""
+    w, rows, scale, p, q, inv_nu = op
     if sym:
-        return accumulate_uz(v, w, rows)[0]
-    S = rows.size(0)
-    w_t = _unshift(w.view(S, -1, *w.shape[1:]), st["roll"]).reshape(w.shape).contiguous()
-    return accumulate_uz(v, w_t, st["rows_full_T"])[0]
+        HTv = accumulate_uz(v, w, rows)[0]
+    else:
+        S = rows.size(0)
+        w_t = _unshift(w.view(S, -1, *w.shape[1:]), st["roll"]).reshape(w.shape).contiguous()
+        HTv = accumulate_uz(v, w_t, st["rows_full_T"])[0]
+    return _finish(HTv, v, scale, q, p, inv_nu)
 
 
 def _run(self, fn, m: torch.Tensor, x: torch.Tensor):
@@ -194,8 +253,15 @@ def _run(self, fn, m: torch.Tensor, x: torch.Tensor):
     return fn(m, x)
 
 
-def _eps(self, dtype):
-    return max(self.metropolis_eps, torch.finfo(dtype).tiny)
+def _modes(self, dtype):
+    """(sym, glob, corr, eps) of the model's normalisation route."""
+    corr = bool(self.diag_correction)
+    if corr and not hasattr(self, "mu_mode"):
+        # Pre-Section-2 model files meant a diagonal reset by diag_correction.
+        raise ValueError("diag_correction=True needs an NKD_mp_dss model with mu_mode "
+                         "(rank-one completion); this model file predates it.")
+    return (self.kernel_mode == "symmetric", getattr(self, "mu_mode", "local") == "global",
+            corr, max(self.metropolis_eps, torch.finfo(dtype).tiny))
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +272,10 @@ def _forward_cuda(self, x, guide=None, sig=None, return_D: bool = False):
     """(W x, W e if return_D)."""
     m = _mixed_half(self, x, guide, sig)
     st = _static(self, x.size(2), x.size(3), x.device, m.dtype)
-    sym, corr, eps = self.kernel_mode == "symmetric", bool(self.diag_correction), _eps(self, m.dtype)
+    sym, glob, corr, eps = _modes(self, m.dtype)
 
     def fn(m_, x_):
-        w, rows = _operator(m_, st, sym, corr, eps)
-        return accumulate_uz(x_, w, rows)
+        return _apply(x_, _operator(m_, st, sym, glob, corr, eps))
 
     Wx, We = _run(self, fn, m, x.contiguous())
     return Wx, (We if return_D else None)
@@ -220,11 +285,10 @@ def _adjoint_cuda(self, y, guide=None, sig=None):
     """W^T y."""
     m = _mixed_half(self, y, guide, sig)
     st = _static(self, y.size(2), y.size(3), y.device, m.dtype)
-    sym, corr, eps = self.kernel_mode == "symmetric", bool(self.diag_correction), _eps(self, m.dtype)
+    sym, glob, corr, eps = _modes(self, m.dtype)
 
     def fn(m_, y_):
-        w, rows = _operator(m_, st, sym, corr, eps)
-        return _apply_T(y_, w, rows, st, sym)
+        return _apply_T(y_, _operator(m_, st, sym, glob, corr, eps), st, sym)
 
     return _run(self, fn, m, y.contiguous())
 
@@ -233,12 +297,12 @@ def _laplacian_grw_cuda(self, x, guide=None, sig=None, eps=1e-10):
     """(I - W)^T (I - W) x from one network pass and one operator build."""
     m = _mixed_half(self, x, guide, sig)
     st = _static(self, x.size(2), x.size(3), x.device, m.dtype)
-    sym, corr, e = self.kernel_mode == "symmetric", bool(self.diag_correction), _eps(self, m.dtype)
+    sym, glob, corr, e = _modes(self, m.dtype)
 
     def fn(m_, x_):
-        w, rows = _operator(m_, st, sym, corr, e)
-        z = x_ - accumulate_uz(x_, w, rows)[0]
-        return z - _apply_T(z.contiguous(), w, rows, st, sym)
+        op = _operator(m_, st, sym, glob, corr, e)
+        z = x_ - _apply(x_, op)[0]
+        return z - _apply_T(z.contiguous(), op, st, sym)
 
     return _run(self, fn, m, x.contiguous())
 
@@ -279,15 +343,26 @@ def _cached_pack(self, x: torch.Tensor, cache, transpose: bool):
     return w_all, rows
 
 
+def _cache_terms(cache):
+    """(scale, p, q, inv_nu) of a DSSWeightCache; all None for pre-Section-2 caches."""
+    return tuple(getattr(cache, k, None) for k in ("scale", "p", "q", "inv_nu"))
+
+
 def _forward_cached_cuda(self, x, cache, return_D: bool = False):
     w_all, rows = _cached_pack(self, x, cache, transpose=False)
-    Wx, We = accumulate_uz(x.contiguous(), w_all, rows)
-    return Wx, (We if return_D else None)
+    scale, p, q, inv_nu = _cache_terms(cache)
+    Hx, Z = accumulate_uz(x.contiguous(), w_all, rows)
+    Wx = _finish(Hx, x, scale, p, q, inv_nu)
+    if not return_D:
+        return Wx, None
+    row_sum = getattr(cache, "row_sum", None)   # the model's own W e when it has one
+    return Wx, (row_sum if row_sum is not None else _row_sum(Z, scale, p, q, inv_nu))
 
 
 def _adjoint_cached_cuda(self, y, cache):
     w_t, rows = _cached_pack(self, y, cache, transpose=True)
-    return accumulate_uz(y.contiguous(), w_t, rows)[0]
+    scale, p, q, inv_nu = _cache_terms(cache)
+    return _finish(accumulate_uz(y.contiguous(), w_t, rows)[0], y, scale, q, p, inv_nu)
 
 
 # ---------------------------------------------------------------------------

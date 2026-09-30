@@ -40,7 +40,8 @@ same installer:
     install_cuda_shift_gasd(GASDDRUNetAttn)
 
 Doubly sub-stochastic NKD (NKD_mp_dss_*: symmetric or asymmetric inverse-pair
-kernel, W_ij = K_ij / max(r_i, c_j), optional diagonal correction). Patches
+kernel, H = K scaled by the local max(r_i, c_j) or a global mu, optional rank-one
+completion W = H + p q^T / nu). Patches
 forward / adjoint / laplacian_grw and the cached forward / adjoint:
 
     from neural_shift_cuda.integration import install_cuda_shift_mp_dss
