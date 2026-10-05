@@ -1,4 +1,4 @@
-"""GASD (both shift_modes) and NKD_mp_dss (kernel_modes x mu_mode x diag_correction)
+"""GASD (both shift_modes) and NKD_mp_dss (kernel_modes x construction / scale_mode / diag_correction)
 patch paths vs the models' own PyTorch reference methods.
 
 Model files are loaded by path:
@@ -135,16 +135,18 @@ def test_gasd_patch_matches_reference(device, shift_mode, arch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("diag_correction", [False, True])
-@pytest.mark.parametrize("mu_mode", ["local", "global"])
+@pytest.mark.parametrize("construction,scale_mode,diag_correction", [
+    ("metropolis", "local", False), ("metropolis", "local", True),
+    ("metropolis", "global", False), ("metropolis", "global", True),
+    ("optimal_transport", "global", False)])
 @pytest.mark.parametrize("kernel_mode,shift_mode", [
     ("asymmetric", "inverse_pair"), ("symmetric", "inverse_pair"), ("asymmetric", "legacy")])
 @pytest.mark.parametrize("arch", list(DSS_ARCHS))
-def test_dss_patch_matches_reference(device, kernel_mode, shift_mode, diag_correction, mu_mode,
-                                      arch):
+def test_dss_patch_matches_reference(device, kernel_mode, shift_mode, construction, scale_mode,
+                                      diag_correction, arch):
     m = _model(DSS_ARCHS, arch, dss_patch.install_cuda_shift, device,
-               kernel_mode=kernel_mode, shift_mode=shift_mode,
-               diag_correction=diag_correction, mu_mode=mu_mode)
+               kernel_mode=kernel_mode, shift_mode=shift_mode, construction=construction,
+               diag_correction=diag_correction, scale_mode=scale_mode)
     x, z, y, sig = _inputs(device)
 
     Wx, We = dss_patch._forward_cuda(m, x, guide=z, sig=sig, return_D=True)

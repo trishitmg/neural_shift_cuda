@@ -4,12 +4,18 @@ The model builds, per guide, J = 2R^2 + 2R + 1 head-mixed maps on the
 half-plane G+ = {id} u I+ and turns them into the kernel K (`kernel_mode`):
   'symmetric'   K = D_id + sum_{pi in I+} (D_pi P_pi + P_{pi^{-1}} D_pi)
   'asymmetric'  K = D_id + sum_{pi in I+} D_pi (P_pi + P_{pi^{-1}})
-then scales it to H with r = K e, c = K^T e (`mu_mode`):
-    'local'   H_{i,i+d} = K_{i,i+d} / max(r_i, (P_d c)_i),
-    'global'  H = K / max(||r||_inf, ||c||_inf)  per (image, channel),
-and, with `diag_correction`, adds the rank-one completion
-    W = H + p q^T / nu,   p = e - H e, q = e - H^T e, nu = e^T p
-(W = H otherwise).
+then builds W from K, with r = K e, c = K^T e (`construction`):
+  'metropolis' -- scales K to H (`scale_mode`, formerly `mu_mode`):
+      'local'   H_{i,i+d} = K_{i,i+d} / max(r_i, (P_d c)_i),
+      'global'  H = K / max(||r||_inf, ||c||_inf)  per (image, channel),
+    and, with `diag_correction`, adds the rank-one completion
+      W = H + p q^T / nu,   p = e - H e, q = e - H^T e, nu = e^T p
+    (W = H otherwise).
+  'optimal_transport' -- W = J + Q K Q / lambda_0, lambda_0 = max r + max c
+    - kappa / n per (image, channel), applied as eq. (16) of the DSS note:
+      W v = K v / lambda + (1/n + kappa/(lambda n^2)) (e^T v) e
+            - ((e^T v) r + (e^T K v) e) / (lambda n),
+    W^T v the same with K^T and r <-> c.
 
 This patch replaces the per-shift Python loops by the package's fused,
 differentiable primitives; the attention head is still the model's own
@@ -30,7 +36,9 @@ In both, the diagonal of H is folded into the identity row, so one
 `accumulate_uz` applies the banded part and its Z output is its row sum. With
 'global' the rows carry K itself and 1/mu multiplies the result; with
 `diag_correction` the rank-one term (q^T v / nu) p (transpose: (p^T v / nu) q)
-is added after the call, so the dense p q^T is never formed.
+is added after the call, so the dense p q^T is never formed. Optimal transport
+reuses the 'global' operand (rows carry K, scale = 1/lambda) and adds the
+eq. (16) mean terms after the call, so J and Q are never formed either.
 
 Patched: forward, adjoint, laplacian_grw, forward_cached, adjoint_cached.
 DSG_NLM, laplacian_{un,rw,norm} and the *_cached Laplacians route through
@@ -42,8 +50,8 @@ leaving the image are always masked.
 Usage
 -----
     from NKD_mp_dss_drunet_attn_v2 import NeKDeDSSDRUNetAttn
-    from neural_shift_cuda.integration import install_cuda_shift_mp_dss
-    install_cuda_shift_mp_dss(NeKDeDSSDRUNetAttn)
+    from neural_shift_cuda.integration import install_cuda_shift_metropolis_dss
+    install_cuda_shift_metropolis_dss(NeKDeDSSDRUNetAttn)
 
 Set ``model.use_cuda_shift = False`` to force the reference PyTorch path.
 """
@@ -145,9 +153,11 @@ def _mixed_half(self, x: torch.Tensor, guide, sig) -> torch.Tensor:
 
 # ---------------------------------------------------------------------------
 # W as an accumulate_uz operand plus a scale and a rank-one term:
-#   op = (w, rows, scale, p, q, inv_nu),
+#   op = (w, rows, scale, p, q, inv_nu, ot),
 #   H v = scale * accumulate_uz(v, w, rows)[0]      (scale None -> 1),
 #   W v = H v + (q^T v) inv_nu p                    (p None -> W = H).
+# Optimal transport: ot = (r, c, kappa), rows carry K, scale = 1/lambda_0, and
+#   W v = eq. (16) from K v (see _ot_finish); p, q are None.
 # ---------------------------------------------------------------------------
 
 def _spatial_sum(t: torch.Tensor) -> torch.Tensor:
@@ -157,7 +167,18 @@ def _spatial_sum(t: torch.Tensor) -> torch.Tensor:
                  dtype=torch.promote_types(t.dtype, torch.float32))
 
 
-def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps: float):
+def _ot_scale(r: torch.Tensor, c: torch.Tensor):
+    """(1/lambda_0, kappa) exactly as the model's _ot_operator: kappa and lambda_0
+    in >= fp32, lambda_0 >= max c > 0 so no floor."""
+    n = r.size(-2) * r.size(-1)
+    kappa = _spatial_sum(r)
+    lam = (r.amax(dim=(-2, -1), keepdim=True)
+           + c.amax(dim=(-2, -1), keepdim=True)).to(kappa.dtype) - kappa / n
+    return (1.0 / lam).to(r.dtype), kappa
+
+
+def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps: float,
+              ot: bool = False):
     J, B, C, H, W = m.shape
     e = m * st["mask_fwd"]                                      # forward edges
     He = HTe = None
@@ -168,6 +189,9 @@ def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps:
         ones = torch.ones(B, C, H, W, device=m.device, dtype=m.dtype)
         _, r = accumulate_uz(ones, e.reshape(-1, C, H, W), rows)  # r = K e = K^T e
         r = r.to(m.dtype)
+        if ot:
+            scale, kappa = _ot_scale(r, r)
+            return e.reshape(-1, C, H, W), rows, scale, None, None, None, (r, r, kappa)
         if glob:
             w = e                                               # rows carry K itself
             scale = 1.0 / r.amax(dim=(-2, -1), keepdim=True)
@@ -185,6 +209,9 @@ def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps:
         S = e.size(0)
         r = e.sum(0)
         c = _unshift(e, st["roll"]).sum(0)                      # K^T e
+        if ot:
+            scale, kappa = _ot_scale(r, c)
+            return e.reshape(-1, C, H, W), rows, scale, None, None, None, (r, c, kappa)
         if glob:
             w = e
             scale = 1.0 / torch.maximum(r.amax(dim=(-2, -1), keepdim=True),
@@ -198,14 +225,23 @@ def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps:
 
     w = w.reshape(-1, C, H, W)
     if not corr:
-        return w, rows, scale, None, None, None
+        return w, rows, scale, None, None, None, None
     # As the model: deficits clamped at 0 (W >= 0 exactly), nu = e^T p, nu = 0 -> W = H.
     p = (1.0 - He).clamp_min(0.0)
     q = p if sym else (1.0 - HTe).clamp_min(0.0)
     nu = _spatial_sum(p)
     inv_nu = torch.where(nu > 0, nu.clamp_min(torch.finfo(nu.dtype).tiny).reciprocal(),
                          torch.zeros_like(nu))
-    return w, rows, scale, p, q, inv_nu
+    return w, rows, scale, p, q, inv_nu, None
+
+
+def _ot_finish(Kv: torch.Tensor, v: torch.Tensor, b: torch.Tensor, inv_lam, kappa) -> torch.Tensor:
+    """Eq. (16) from K v (b = r); the adjoint from K^T v (b = c). Same order of
+    operations as the model's _ot_mean_terms."""
+    n = v.size(-2) * v.size(-1)
+    s, t = _spatial_sum(v), _spatial_sum(Kv)                    # e^T v, e^T K v
+    const = s * (1.0 / n + kappa * inv_lam / n ** 2) - t * inv_lam / n
+    return Kv * inv_lam + const.to(Kv.dtype) - (s * inv_lam / n).to(Kv.dtype) * b
 
 
 def _finish(Hv: torch.Tensor, v: torch.Tensor, scale, a, b, inv_nu) -> torch.Tensor:
@@ -228,20 +264,24 @@ def _row_sum(Z: torch.Tensor, scale, p, q, inv_nu) -> torch.Tensor:
 
 def _apply(v: torch.Tensor, op):
     """(W v, W e) for the operand returned by _operator."""
-    w, rows, scale, p, q, inv_nu = op
+    w, rows, scale, p, q, inv_nu, ot = op
     Hv, Z = accumulate_uz(v, w, rows)
+    if ot is not None:  # doubly stochastic: W e = e exactly (the model returns ones)
+        return _ot_finish(Hv, v, ot[0], scale, ot[2]), torch.ones_like(ot[0])
     return _finish(Hv, v, scale, p, q, inv_nu), _row_sum(Z, scale, p, q, inv_nu)
 
 
 def _apply_T(v: torch.Tensor, op, st: dict, sym: bool):
     """W^T v for the operand returned by _operator."""
-    w, rows, scale, p, q, inv_nu = op
+    w, rows, scale, p, q, inv_nu, ot = op
     if sym:
         HTv = accumulate_uz(v, w, rows)[0]
     else:
         S = rows.size(0)
         w_t = _unshift(w.view(S, -1, *w.shape[1:]), st["roll"]).reshape(w.shape).contiguous()
         HTv = accumulate_uz(v, w_t, st["rows_full_T"])[0]
+    if ot is not None:
+        return _ot_finish(HTv, v, ot[1], scale, ot[2])
     return _finish(HTv, v, scale, q, p, inv_nu)
 
 
@@ -254,14 +294,18 @@ def _run(self, fn, m: torch.Tensor, x: torch.Tensor):
 
 
 def _modes(self, dtype):
-    """(sym, glob, corr, eps) of the model's normalisation route."""
+    """(sym, glob, corr, eps, ot) of the model's normalisation route."""
     corr = bool(self.diag_correction)
-    if corr and not hasattr(self, "mu_mode"):
+    # scale_mode (current files) replaced mu_mode (Section-2 files); files with
+    # neither predate the rank-one completion.
+    scale_mode = getattr(self, "scale_mode", getattr(self, "mu_mode", None))
+    if corr and scale_mode is None:
         # Pre-Section-2 model files meant a diagonal reset by diag_correction.
-        raise ValueError("diag_correction=True needs an NKD_mp_dss model with mu_mode "
+        raise ValueError("diag_correction=True needs an NKD_mp_dss model with scale_mode "
                          "(rank-one completion); this model file predates it.")
-    return (self.kernel_mode == "symmetric", getattr(self, "mu_mode", "local") == "global",
-            corr, max(self.metropolis_eps, torch.finfo(dtype).tiny))
+    ot = getattr(self, "construction", "metropolis") == "optimal_transport"
+    return (self.kernel_mode == "symmetric", (scale_mode or "local") == "global",
+            corr, max(self.metropolis_eps, torch.finfo(dtype).tiny), ot)
 
 
 # ---------------------------------------------------------------------------
@@ -272,10 +316,10 @@ def _forward_cuda(self, x, guide=None, sig=None, return_D: bool = False):
     """(W x, W e if return_D)."""
     m = _mixed_half(self, x, guide, sig)
     st = _static(self, x.size(2), x.size(3), x.device, m.dtype)
-    sym, glob, corr, eps = _modes(self, m.dtype)
+    sym, glob, corr, eps, ot = _modes(self, m.dtype)
 
     def fn(m_, x_):
-        return _apply(x_, _operator(m_, st, sym, glob, corr, eps))
+        return _apply(x_, _operator(m_, st, sym, glob, corr, eps, ot))
 
     Wx, We = _run(self, fn, m, x.contiguous())
     return Wx, (We if return_D else None)
@@ -285,10 +329,10 @@ def _adjoint_cuda(self, y, guide=None, sig=None):
     """W^T y."""
     m = _mixed_half(self, y, guide, sig)
     st = _static(self, y.size(2), y.size(3), y.device, m.dtype)
-    sym, glob, corr, eps = _modes(self, m.dtype)
+    sym, glob, corr, eps, ot = _modes(self, m.dtype)
 
     def fn(m_, y_):
-        return _apply_T(y_, _operator(m_, st, sym, glob, corr, eps), st, sym)
+        return _apply_T(y_, _operator(m_, st, sym, glob, corr, eps, ot), st, sym)
 
     return _run(self, fn, m, y.contiguous())
 
@@ -297,10 +341,10 @@ def _laplacian_grw_cuda(self, x, guide=None, sig=None, eps=1e-10):
     """(I - W)^T (I - W) x from one network pass and one operator build."""
     m = _mixed_half(self, x, guide, sig)
     st = _static(self, x.size(2), x.size(3), x.device, m.dtype)
-    sym, glob, corr, e = _modes(self, m.dtype)
+    sym, glob, corr, e, ot = _modes(self, m.dtype)
 
     def fn(m_, x_):
-        op = _operator(m_, st, sym, glob, corr, e)
+        op = _operator(m_, st, sym, glob, corr, e, ot)
         z = x_ - _apply(x_, op)[0]
         return z - _apply_T(z.contiguous(), op, st, sym)
 
@@ -348,10 +392,22 @@ def _cache_terms(cache):
     return tuple(getattr(cache, k, None) for k in ("scale", "p", "q", "inv_nu"))
 
 
+def _cache_ot(cache):
+    """(r, c, kappa) of an optimal-transport DSSWeightCache, else None."""
+    if getattr(cache, "kappa", None) is None:
+        return None
+    return cache.r, cache.c, cache.kappa
+
+
 def _forward_cached_cuda(self, x, cache, return_D: bool = False):
     w_all, rows = _cached_pack(self, x, cache, transpose=False)
     scale, p, q, inv_nu = _cache_terms(cache)
     Hx, Z = accumulate_uz(x.contiguous(), w_all, rows)
+    ot = _cache_ot(cache)
+    if ot is not None:
+        Wx = _ot_finish(Hx, x, ot[0], scale, ot[2])
+        return Wx, ((cache.row_sum if cache.row_sum is not None else torch.ones_like(ot[0]))
+                    if return_D else None)
     Wx = _finish(Hx, x, scale, p, q, inv_nu)
     if not return_D:
         return Wx, None
@@ -362,7 +418,11 @@ def _forward_cached_cuda(self, x, cache, return_D: bool = False):
 def _adjoint_cached_cuda(self, y, cache):
     w_t, rows = _cached_pack(self, y, cache, transpose=True)
     scale, p, q, inv_nu = _cache_terms(cache)
-    return _finish(accumulate_uz(y.contiguous(), w_t, rows)[0], y, scale, q, p, inv_nu)
+    KTy = accumulate_uz(y.contiguous(), w_t, rows)[0]
+    ot = _cache_ot(cache)
+    if ot is not None:
+        return _ot_finish(KTy, y, ot[1], scale, ot[2])
+    return _finish(KTy, y, scale, q, p, inv_nu)
 
 
 # ---------------------------------------------------------------------------
