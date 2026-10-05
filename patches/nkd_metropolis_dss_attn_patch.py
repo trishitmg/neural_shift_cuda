@@ -1,9 +1,16 @@
 """CUDA patch for the doubly sub-stochastic NKD (NKD_mp_dss_* model files).
 
-The model builds, per guide, J = 2R^2 + 2R + 1 head-mixed maps on the
-half-plane G+ = {id} u I+ and turns them into the kernel K (`kernel_mode`):
-  'symmetric'   K = D_id + sum_{pi in I+} (D_pi P_pi + P_{pi^{-1}} D_pi)
-  'asymmetric'  K = D_id + sum_{pi in I+} D_pi (P_pi + P_{pi^{-1}})
+The model builds, per guide, head-mixed maps over the half-plane
+G+ = {id} u I+ (inverse-pair bookkeeping: each pi in I+ also yields the pi^{-1}
+edge) and turns them into the kernel K (`kernel_mode`; j = i + pi):
+  'symmetric'   K = D_id + sum_{pi in I+} (D_pi P_pi + P_{pi^{-1}} D_pi),
+                one map per unordered edge (J = 2R^2 + 2R + 1 maps);
+  'asymmetric'  K = D_id + sum_{pi in I+} (D+_pi P_pi + P_{pi^{-1}} D-_pi),
+                i -> j and j -> i with their own maps (`direction_mode`:
+                'directional' default, 'gated', 'gated_potential'), which the
+                model's `_directed_affinities` hook returns with each reverse
+                map already at its source pixel; shift_mode='legacy' scores all
+                (2R+1)^2 shifts instead, K = sum_pi D_pi P_pi.
 then builds W from K, with r = K e, c = K^T e (`construction`):
   'metropolis' -- scales K to H (`scale_mode`, formerly `mu_mode`):
       'local'   H_{i,i+d} = K_{i,i+d} / max(r_i, (P_d c)_i),
@@ -18,20 +25,20 @@ then builds W from K, with r = K e, c = K^T e (`construction`):
     W^T v the same with K^T and r <-> c.
 
 This patch replaces the per-shift Python loops by the package's fused,
-differentiable primitives; the attention head is still the model's own
-`_halfplane_weights`:
+differentiable primitives; the affinities are still the model's own
+(`_directed_affinities`):
   * symmetric -- K = K^T, so c = r and W = W^T. Everything stays on the J
     half-plane rows with has_inverse=1: `accumulate_uz` synthesises the box-
     masked mirror edge P_{pi^{-1}} (w) exactly as the model does, r and
     W_hat e come out as its Z output, and max(r_i, r_{i+d}) is one
     `shift_gather`. W^T y = W y.
-  * asymmetric -- the mirror edge keeps the centre-pixel weight, which is not
-    what has_inverse=1 synthesises, so the full (2R+1)^2 edge stack is built
-    (with shift_mode='legacy' the head already scores all (2R+1)^2 shifts and
-    the stack is just the masked head maps)
-    (has_inverse=0 rows). K^T e and C are one batched roll (gather) + sum over
-    the stack; W^T y is `accumulate_uz` with negated shifts on the rolled stack
-    (pi^{-1}(w (.) y) = pi^{-1}(w) (.) pi^{-1}(y)).
+  * asymmetric -- the pi^{-1} edge has its own map, which has_inverse=1 cannot
+    synthesise, so the full (2R+1)^2 edge stack is built (has_inverse=0 rows):
+    the masked forward maps, then the masked head-mixed reverse maps (with
+    shift_mode='legacy' the head already scores all (2R+1)^2 shifts and the
+    stack is just the masked head maps). K^T e and C are one batched roll
+    (gather) + sum over the stack; W^T y is `accumulate_uz` with negated
+    shifts on the rolled stack (pi^{-1}(w (.) y) = pi^{-1}(w) (.) pi^{-1}(y)).
 In both, the diagonal of H is folded into the identity row, so one
 `accumulate_uz` applies the banded part and its Z output is its row sum. With
 'global' the rows carry K itself and 1/mu multiplies the result; with
@@ -111,7 +118,6 @@ def _static(self, H: int, W: int, device: torch.device, dtype: torch.dtype) -> d
         S = d.size(0)
         src = ((hh - d[:, 0].view(S, 1, 1)) % H) * W + (ww - d[:, 1].view(S, 1, 1)) % W
         st.update(
-            nonid=torch.tensor(nonid, dtype=torch.int64, device=device),
             mask_rev=masks([(-scored[k][0], -scored[k][1]) for k in nonid]) if pair else None,
             rows_full=rows(full, [0] * S),
             rows_full_T=rows([(-dx, -dy) for dx, dy in full], [0] * S),
@@ -136,8 +142,13 @@ def _mix_heads_vec(a: torch.Tensor, C: int, mix: Optional[torch.Tensor]) -> torc
     return torch.einsum("ch,sbhij->sbcij", mix, a).contiguous()
 
 
-def _mixed_half(self, x: torch.Tensor, guide, sig) -> torch.Tensor:
-    """Head-mixed J half-plane maps (J, B, C, H, W) from the model's own head."""
+def _mixed_half(self, x: torch.Tensor, guide, sig):
+    """(m, m_rev) from the model's own head: m (J, B, C, H, W) are the head-mixed
+    maps of the scored shifts; m_rev (J-1, B, C, H, W) those of the pi^{-1}
+    edges at their source pixel, or None when m already holds every edge
+    (shift_mode='legacy') or the reverse edge is the mirrored forward one
+    (kernel_mode='symmetric'). Forward, adjoint and the model's cache all
+    come from this one hook, so they see identical directed edges."""
     z = x if guide is None else guide
     if z.shape != x.shape:
         raise ValueError(f"guide shape {tuple(z.shape)} must match x shape {tuple(x.shape)}.")
@@ -146,9 +157,14 @@ def _mixed_half(self, x: torch.Tensor, guide, sig) -> torch.Tensor:
     s = self._normalise_sigma(x, sig)
     phi = self.pre_activation(z, s)
     R = self.window_rad
-    a = torch.stack(list(self._halfplane_weights(
-        phi, F.pad(phi, (R, R, R, R), mode="circular"), s)), dim=0)
-    return _mix_heads_vec(a, x.size(1), self._head_mix_matrix())
+    padded = F.pad(phi, (R, R, R, R), mode="circular")
+    fwd, rev = self._directed_affinities(phi, padded, s)
+    C, mix = x.size(1), self._head_mix_matrix()
+    m = _mix_heads_vec(torch.stack(list(fwd), dim=0), C, mix)
+    # Positive head mixing acts on a+ and a- separately (it is per pixel, so it
+    # commutes with the model's shift of a- to its source pixel).
+    m_rev = None if rev is None else _mix_heads_vec(torch.stack(list(rev), dim=0), C, mix)
+    return m, m_rev
 
 
 # ---------------------------------------------------------------------------
@@ -177,9 +193,13 @@ def _ot_scale(r: torch.Tensor, c: torch.Tensor):
     return (1.0 / lam).to(r.dtype), kappa
 
 
-def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps: float,
-              ot: bool = False):
+def _operator(m: torch.Tensor, m_rev: Optional[torch.Tensor], st: dict, sym: bool,
+              glob: bool, corr: bool, eps: float, ot: bool = False):
     J, B, C, H, W = m.shape
+    if (m_rev is not None) != (not sym and st["pair"]):
+        # Reverse maps exist exactly for the asymmetric inverse-pair kernel.
+        raise ValueError("reverse maps are needed exactly for kernel_mode='asymmetric' "
+                         "with shift_mode='inverse_pair'.")
     e = m * st["mask_fwd"]                                      # forward edges
     He = HTe = None
     scale = None
@@ -204,8 +224,8 @@ def _operator(m: torch.Tensor, st: dict, sym: bool, glob: bool, corr: bool, eps:
         HTe = He                                                # H = H^T
     else:
         rows = st["rows_full"]
-        if st["pair"]:  # inverse_pair: pi^{-1} reuses pi's map; legacy: e is already full
-            e = torch.cat([e, m.index_select(0, st["nonid"]) * st["mask_rev"]], dim=0)  # (S,...)
+        if st["pair"]:  # inverse_pair: pi^{-1} edges appended; legacy: e is already full
+            e = torch.cat([e, m_rev * st["mask_rev"]], dim=0)   # (S, ...)
         S = e.size(0)
         r = e.sum(0)
         c = _unshift(e, st["roll"]).sum(0)                      # K^T e
@@ -285,12 +305,13 @@ def _apply_T(v: torch.Tensor, op, st: dict, sym: bool):
     return _finish(HTv, v, scale, q, p, inv_nu)
 
 
-def _run(self, fn, m: torch.Tensor, x: torch.Tensor):
+def _run(self, fn, m: torch.Tensor, m_rev: Optional[torch.Tensor], x: torch.Tensor):
     """Checkpoint the operator build + apply while training (weights recomputed
-    in backward); plain call otherwise."""
-    if torch.is_grad_enabled() and (m.requires_grad or x.requires_grad):
-        return checkpoint(fn, m, x, use_reentrant=False)
-    return fn(m, x)
+    in backward); plain call otherwise. m_rev may be None."""
+    needs = m.requires_grad or x.requires_grad or (m_rev is not None and m_rev.requires_grad)
+    if torch.is_grad_enabled() and needs:
+        return checkpoint(fn, m, m_rev, x, use_reentrant=False)
+    return fn(m, m_rev, x)
 
 
 def _modes(self, dtype):
@@ -314,41 +335,41 @@ def _modes(self, dtype):
 
 def _forward_cuda(self, x, guide=None, sig=None, return_D: bool = False):
     """(W x, W e if return_D)."""
-    m = _mixed_half(self, x, guide, sig)
+    m, m_rev = _mixed_half(self, x, guide, sig)
     st = _static(self, x.size(2), x.size(3), x.device, m.dtype)
     sym, glob, corr, eps, ot = _modes(self, m.dtype)
 
-    def fn(m_, x_):
-        return _apply(x_, _operator(m_, st, sym, glob, corr, eps, ot))
+    def fn(m_, mr_, x_):
+        return _apply(x_, _operator(m_, mr_, st, sym, glob, corr, eps, ot))
 
-    Wx, We = _run(self, fn, m, x.contiguous())
+    Wx, We = _run(self, fn, m, m_rev, x.contiguous())
     return Wx, (We if return_D else None)
 
 
 def _adjoint_cuda(self, y, guide=None, sig=None):
     """W^T y."""
-    m = _mixed_half(self, y, guide, sig)
+    m, m_rev = _mixed_half(self, y, guide, sig)
     st = _static(self, y.size(2), y.size(3), y.device, m.dtype)
     sym, glob, corr, eps, ot = _modes(self, m.dtype)
 
-    def fn(m_, y_):
-        return _apply_T(y_, _operator(m_, st, sym, glob, corr, eps, ot), st, sym)
+    def fn(m_, mr_, y_):
+        return _apply_T(y_, _operator(m_, mr_, st, sym, glob, corr, eps, ot), st, sym)
 
-    return _run(self, fn, m, y.contiguous())
+    return _run(self, fn, m, m_rev, y.contiguous())
 
 
 def _laplacian_grw_cuda(self, x, guide=None, sig=None, eps=1e-10):
     """(I - W)^T (I - W) x from one network pass and one operator build."""
-    m = _mixed_half(self, x, guide, sig)
+    m, m_rev = _mixed_half(self, x, guide, sig)
     st = _static(self, x.size(2), x.size(3), x.device, m.dtype)
     sym, glob, corr, e, ot = _modes(self, m.dtype)
 
-    def fn(m_, x_):
-        op = _operator(m_, st, sym, glob, corr, e, ot)
+    def fn(m_, mr_, x_):
+        op = _operator(m_, mr_, st, sym, glob, corr, e, ot)
         z = x_ - _apply(x_, op)[0]
         return z - _apply_T(z.contiguous(), op, st, sym)
 
-    return _run(self, fn, m, x.contiguous())
+    return _run(self, fn, m, m_rev, x.contiguous())
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +456,7 @@ def install_cuda_shift(model_cls):
     if getattr(model_cls, "_dss_cuda_installed", False):
         return model_cls
     for name in ("forward", "adjoint", "laplacian_grw", "_scored_shifts",
-                 "_collect_shifts", "_halfplane_weights"):
+                 "_collect_shifts", "_directed_affinities"):
         if not hasattr(model_cls, name):
             raise TypeError(f"{model_cls.__name__} has no {name}; not a NKD_mp_dss model.")
 

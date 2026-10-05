@@ -1,5 +1,8 @@
-"""GASD (both shift_modes) and NKD_mp_dss (kernel_modes x construction / scale_mode / diag_correction)
-patch paths vs the models' own PyTorch reference methods.
+"""GASD (shift_modes x direction_modes) and NKD_mp_dss (kernel_modes x
+direction_modes x construction / scale_mode / diag_correction) patch paths vs
+the models' own PyTorch reference methods, plus the direction_mode
+equivalences (directional == legacy for the same weights; gated at a zero gate
+== the symmetric raw kernel).
 
 Model files are loaded by path:
 
@@ -59,13 +62,32 @@ def _load(fname, cls_name, installer):
     return cls, None
 
 
-def _model(table, arch, installer, device, **kw):
+def _model(table, arch, installer, device, active_gate=True, **kw):
     fname, cls_name, extra = table[arch]
     cls, why = _load(fname, cls_name, installer)
     if cls is None:
         pytest.skip(why)
+    kw = {k: v for k, v in kw.items() if v is not None}  # None -> the model's default
     torch.manual_seed(0)
-    return cls(**_BASE, **extra, **kw).to(device=device, dtype=torch.float64).eval()
+    m = cls(**_BASE, **extra, **kw).to(device=device, dtype=torch.float64).eval()
+    gate = getattr(m, "direction_gate", None)
+    if gate is not None and active_gate:
+        # The gate's output projection starts at zero (g = 1/2, the symmetric
+        # kernel); randomise it so the directed path is actually exercised.
+        g = torch.Generator().manual_seed(2)
+        with torch.no_grad():
+            for p in gate.parameters():
+                p.copy_(0.5 * torch.randn(p.shape, generator=g, dtype=p.dtype))
+    return m
+
+
+def _twin(table, arch, installer, device, src, **kw):
+    """A second model of the same arch whose shared parameters are copied from
+    `src` (parameters only one of the two has, i.e. the gate, are left out)."""
+    m = _model(table, arch, installer, device, **kw)
+    missing, unexpected = m.load_state_dict(src.state_dict(), strict=False)
+    assert all(k.startswith("direction_gate.") for k in missing + unexpected), (missing, unexpected)
+    return m
 
 
 def _inputs(device):
@@ -94,12 +116,16 @@ def _grads(model, x, fn):
 # GASD
 # ---------------------------------------------------------------------------
 
+_DIRECTED = ["directional", "gated", "gated_potential"]
+
+
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("shift_mode", ["inverse_pair", "legacy"])
+@pytest.mark.parametrize("shift_mode,direction_mode",
+                         [("inverse_pair", d) for d in _DIRECTED] + [("legacy", "directional")])
 @pytest.mark.parametrize("arch", list(GASD_ARCHS))
-def test_gasd_patch_matches_reference(device, shift_mode, arch):
+def test_gasd_patch_matches_reference(device, shift_mode, direction_mode, arch):
     m = _model(GASD_ARCHS, arch, gasd_patch.install_cuda_shift, device,
-               shift_mode=shift_mode)
+               shift_mode=shift_mode, direction_mode=direction_mode)
     x, z, y, sig = _inputs(device)
 
     U, Z = gasd_patch._forward_cuda(m, x, guide=z, sig=sig, return_D=True)
@@ -130,23 +156,57 @@ def test_gasd_patch_matches_reference(device, shift_mode, arch):
         torch.testing.assert_close(a, b, **TOL)
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("arch", list(GASD_ARCHS))
+def test_gasd_directional_matches_legacy(device, arch):
+    """Same weights, no new parameters: inverse_pair + directional == legacy."""
+    leg = _model(GASD_ARCHS, arch, gasd_patch.install_cuda_shift, device, shift_mode="legacy")
+    dirn = _twin(GASD_ARCHS, arch, gasd_patch.install_cuda_shift, device, leg,
+                 direction_mode="directional")
+    assert sum(p.numel() for p in dirn.parameters()) == sum(p.numel() for p in leg.parameters())
+    x, z, y, sig = _inputs(device)
+    for a, b in zip(gasd_patch._forward_cuda(dirn, x, guide=z, sig=sig, return_D=True),
+                    gasd_patch._forward_cuda(leg, x, guide=z, sig=sig, return_D=True)):
+        torch.testing.assert_close(a, b, **TOL)
+    torch.testing.assert_close(gasd_patch._kt_action_cuda(dirn, y, guide=z, sig=sig),
+                               gasd_patch._kt_action_cuda(leg, y, guide=z, sig=sig), **TOL)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("direction_mode", ["gated", "gated_potential"])
+@pytest.mark.parametrize("arch", list(GASD_ARCHS))
+def test_gasd_zero_gate_is_symmetric(device, direction_mode, arch):
+    """At init (zero gate logits, g = 1/2) a+ = b and a- = P_{pi^{-1}} b, so the
+    raw kernel is D_id + sum (D_pi P_pi + P_{pi^{-1}} D_pi) = K^T."""
+    m = _model(GASD_ARCHS, arch, gasd_patch.install_cuda_shift, device, active_gate=False,
+               direction_mode=direction_mode)
+    x, z, y, sig = _inputs(device)
+    U, D = gasd_patch._forward_cuda(m, y, guide=z, sig=sig, return_D=True)
+    torch.testing.assert_close(gasd_patch._kt_action_cuda(m, y, guide=z, sig=sig), U * D, **TOL)
+
+
 # ---------------------------------------------------------------------------
 # NKD_mp_dss
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("construction,scale_mode,diag_correction", [
+_DSS_ROUTES = [
     ("metropolis", "local", False), ("metropolis", "local", True),
     ("metropolis", "global", False), ("metropolis", "global", True),
-    ("optimal_transport", "global", False)])
-@pytest.mark.parametrize("kernel_mode,shift_mode", [
-    ("asymmetric", "inverse_pair"), ("symmetric", "inverse_pair"), ("asymmetric", "legacy")])
+    ("optimal_transport", "global", False)]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("construction,scale_mode,diag_correction", _DSS_ROUTES)
+@pytest.mark.parametrize("kernel_mode,shift_mode,direction_mode",
+                         [("asymmetric", "inverse_pair", d) for d in _DIRECTED]
+                         + [("symmetric", "inverse_pair", None), ("asymmetric", "legacy", None)])
 @pytest.mark.parametrize("arch", list(DSS_ARCHS))
-def test_dss_patch_matches_reference(device, kernel_mode, shift_mode, construction, scale_mode,
-                                      diag_correction, arch):
+def test_dss_patch_matches_reference(device, kernel_mode, shift_mode, direction_mode,
+                                      construction, scale_mode, diag_correction, arch):
     m = _model(DSS_ARCHS, arch, dss_patch.install_cuda_shift, device,
-               kernel_mode=kernel_mode, shift_mode=shift_mode, construction=construction,
-               diag_correction=diag_correction, scale_mode=scale_mode)
+               kernel_mode=kernel_mode, shift_mode=shift_mode, direction_mode=direction_mode,
+               construction=construction, diag_correction=diag_correction,
+               scale_mode=scale_mode)
     x, z, y, sig = _inputs(device)
 
     Wx, We = dss_patch._forward_cuda(m, x, guide=z, sig=sig, return_D=True)
@@ -177,12 +237,58 @@ def test_dss_patch_matches_reference(device, kernel_mode, shift_mode, constructi
         torch.testing.assert_close(a, b, **TOL)
 
 
+def _dss_ops(m, x, y, z, sig):
+    """(W x, W e, W^T y, cached W x, cached W^T y) on the patch path."""
+    cache = m.build_weight_cache(z, sig)
+    return (*dss_patch._forward_cuda(m, x, guide=z, sig=sig, return_D=True),
+            dss_patch._adjoint_cuda(m, y, guide=z, sig=sig),
+            dss_patch._forward_cached_cuda(m, x, cache)[0],
+            dss_patch._adjoint_cached_cuda(m, y, cache))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("construction,scale_mode,diag_correction", _DSS_ROUTES)
+@pytest.mark.parametrize("arch", list(DSS_ARCHS))
+def test_dss_directional_matches_legacy(device, construction, scale_mode, diag_correction, arch):
+    """Same weights, no new parameters: asymmetric inverse_pair + directional ==
+    asymmetric legacy, on every normalisation route."""
+    kw = dict(kernel_mode="asymmetric", construction=construction, scale_mode=scale_mode,
+              diag_correction=diag_correction)
+    leg = _model(DSS_ARCHS, arch, dss_patch.install_cuda_shift, device, shift_mode="legacy", **kw)
+    dirn = _twin(DSS_ARCHS, arch, dss_patch.install_cuda_shift, device, leg,
+                 direction_mode="directional", **kw)
+    assert sum(p.numel() for p in dirn.parameters()) == sum(p.numel() for p in leg.parameters())
+    x, z, y, sig = _inputs(device)
+    for a, b in zip(_dss_ops(dirn, x, y, z, sig), _dss_ops(leg, x, y, z, sig)):
+        torch.testing.assert_close(a, b, **TOL)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("construction,scale_mode,diag_correction", _DSS_ROUTES)
+@pytest.mark.parametrize("direction_mode", ["gated", "gated_potential"])
+@pytest.mark.parametrize("arch", list(DSS_ARCHS))
+def test_dss_zero_gate_matches_symmetric(device, direction_mode, construction, scale_mode,
+                                         diag_correction, arch):
+    """At init (zero gate logits, g = 1/2) both directed affinities equal b, so
+    the gated asymmetric model reproduces kernel_mode='symmetric'."""
+    kw = dict(construction=construction, scale_mode=scale_mode, diag_correction=diag_correction)
+    gated = _model(DSS_ARCHS, arch, dss_patch.install_cuda_shift, device, active_gate=False,
+                   kernel_mode="asymmetric", direction_mode=direction_mode, **kw)
+    sym = _twin(DSS_ARCHS, arch, dss_patch.install_cuda_shift, device, gated,
+                kernel_mode="symmetric", **kw)
+    x, z, y, sig = _inputs(device)
+    for a, b in zip(_dss_ops(gated, x, y, z, sig), _dss_ops(sym, x, y, z, sig)):
+        torch.testing.assert_close(a, b, **TOL)
+
+
 @pytest.mark.parametrize("kernel_mode", ["asymmetric", "symmetric"])
 def test_dss_installer_routes_cpu_to_reference(kernel_mode):
     m = _model(DSS_ARCHS, "drunet", dss_patch.install_cuda_shift, "cpu",
                kernel_mode=kernel_mode)
     x, z, y, sig = _inputs("cpu")
     assert type(m)._dss_cuda_installed
+    # 'directional' is the default for the asymmetric kernel; none for the symmetric one.
+    assert m.direction_mode == ("directional" if kernel_mode == "asymmetric" else None)
     # CPU tensors never take the CUDA path, whatever use_cuda_shift says.
     torch.testing.assert_close(m.forward(x, z, sig=sig)[0],
                                _ref(m, lambda: m.forward(x, z, sig=sig)[0]), rtol=0, atol=0)

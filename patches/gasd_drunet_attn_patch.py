@@ -23,19 +23,21 @@ GASD is the ROW-stochastic (singly-stochastic) denoiser  W = Z^{-1}U:
     half-plane, no `has_inverse` flag), aligned with `_all_shift_weights`.
     With shift_mode='legacy' (and older files) every shift's weight is
     produced independently; with shift_mode='inverse_pair' (the truncated
-    GASD_drunet_attn_v2 default) the head scores only the J = 2R^2+2R+1
-    half-plane shifts and pi^{-1} reuses pi's map unshifted,
-        K = D_id + sum_{pi in I+} D_pi (P_pi + P_{pi^{-1}});
+    GASD_drunet_attn_v2 default) the edges are bookkept over the J = 2R^2+2R+1
+    half-plane shifts, and pi^{-1} gets its own map (`direction_mode`), at
+    its source pixel,
+        K = D_id + sum_{pi in I+} (D+_pi P_pi + P_{pi^{-1}} D-_pi);
   * `forward` accumulates each shift exactly ONCE -- there is no circular-shift
     inverse twin, so U is non-symmetric and K = Z^{-1}U is only row-stochastic.
 The NeKDe patch, by contrast, feeds a half-plane shift list with `has_inverse=1`
 and lets `accumulate_uz` synthesise the symmetric twin P_{pi^{-1}} D_pi. That is
-NOT the inverse_pair edge D_pi P_{pi^{-1}}, so here the (S, 3) shift tensor has
-the inverse flag set to 0 on EVERY row and `accumulate_uz` performs the forward
-circular gather only -- the exact full-window, non-symmetric operator GASD's
-reference forward computes, in either shift_mode. Under inverse_pair only the
-weight-stack construction differs (`_masked_weight_stack`: J maps head-mixed,
-then expanded).
+NOT GASD's inverse_pair edge P_{pi^{-1}} D-_pi (its own map), so here the (S, 3)
+shift tensor has the inverse flag set to 0 on EVERY row and `accumulate_uz`
+performs the forward circular gather only -- the exact full-window,
+non-symmetric operator GASD's reference forward computes, in either
+shift_mode and every `direction_mode` ('directional' default, 'gated',
+'gated_potential'). The stack is the model's `_all_shift_weights` (forward,
+then reverse maps; all S head-mixed), so only the kernel call is replaced.
 
 comp_box toggle
 ---------------
@@ -174,34 +176,18 @@ def _mix_heads_vec(
 
 def _masked_weight_stack(self, phi, sig, ref: torch.Tensor) -> torch.Tensor:
     """Head-mixed, comp_box-masked per-shift weights (S, B, C, H, W) in
-    `_collect_shifts` order, from the model's projection-once gather path.
-
-    shift_mode='inverse_pair' scores only the J = 2R^2+2R+1 half-plane shifts
-    and reuses pi's map, unshifted, for pi^{-1}. The J maps are head-mixed once
-    and then expanded with the model's own `_pair_up` ordering (an index
-    select), instead of stacking and mixing all (2R+1)^2 copies. Each
-    translation still gets its own mask, and the (S, ...) stack is what
-    accumulate_uz consumes. Legacy / older GASD files take the generic path.
+    `_collect_shifts` order, from the model's projection-once gather path
+    (`_all_shift_weights`: under inverse_pair the forward maps, then each
+    pi^{-1}'s own map at its source pixel). Each translation gets its own
+    mask, and the (S, ...) stack is what accumulate_uz consumes.
     """
     B, C, H, W = ref.shape
     R = self.window_rad
     padded_phi = F.pad(phi, (R, R, R, R), mode="circular")
     shift_list = self._collect_shifts()
     head_mix_mat = _head_mix_mat(self)
-    if getattr(self, "shift_mode", None) == "inverse_pair" and hasattr(self, "_pair_up"):
-        scored = list(self._gather_core(phi, padded_phi, sig))
-        w_half = _mix_heads_vec(torch.stack(scored, dim=0), C, head_mix_mat)
-        key = (len(scored), str(ref.device))
-        if getattr(self, "_cached_pair_key", None) != key:
-            self._cached_pair_index = torch.tensor(
-                self._pair_up(list(range(len(scored)))),
-                dtype=torch.int64, device=ref.device)
-            self._cached_pair_key = key
-        w_stack = w_half.index_select(0, self._cached_pair_index)
-    else:
-        weights_list = self._all_shift_weights(phi, padded_phi, sig, shift_list)
-        w_stack = _mix_heads_vec(
-            torch.stack(list(weights_list), dim=0), C, head_mix_mat)
+    weights_list = self._all_shift_weights(phi, padded_phi, sig, shift_list)
+    w_stack = _mix_heads_vec(torch.stack(list(weights_list), dim=0), C, head_mix_mat)
     if bool(getattr(self, "comp_box", True)):
         # comp_box mask, built exactly like the model's zero-padded `ones`
         # box; depends only on the shift, so (S, 1, 1, H, W) broadcasts.
